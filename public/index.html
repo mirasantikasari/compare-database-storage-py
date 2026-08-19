@@ -1,0 +1,602 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Object Storage & MySQL Reconciler</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #171a21;
+    --border: #2a2f3a;
+    --text: #e6e9ef;
+    --muted: #9aa3b2;
+    --accent: #4f8cff;
+    --ok: #3ecf8e;
+    --warn: #f5a524;
+    --err: #f5555a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+  }
+  header {
+    padding: 24px 32px;
+    border-bottom: 1px solid var(--border);
+  }
+  header h1 { margin: 0 0 4px; font-size: 20px; }
+  header p { margin: 0; color: var(--muted); font-size: 13px; }
+  main {
+    max-width: 1000px;
+    margin: 0 auto;
+    padding: 24px 32px 64px;
+    display: flex;
+    flex-direction: column;
+    gap: 24px;
+  }
+  section.card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 20px;
+  }
+  section.card h2 {
+    margin: 0 0 4px;
+    font-size: 15px;
+  }
+  section.card .hint {
+    margin: 0 0 16px;
+    color: var(--muted);
+    font-size: 12px;
+  }
+  .row {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+    align-items: center;
+    margin-bottom: 12px;
+  }
+  label { font-size: 12px; color: var(--muted); }
+  input[type="text"], input[type="number"], select {
+    background: #0c0e12;
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 6px;
+    padding: 7px 10px;
+    font-size: 13px;
+  }
+  button {
+    background: var(--accent);
+    color: #fff;
+    border: none;
+    border-radius: 6px;
+    padding: 8px 14px;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  button:hover { filter: brightness(1.1); }
+  button.secondary {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--text);
+  }
+  button.danger {
+    background: transparent;
+    border: 1px solid var(--err);
+    color: var(--err);
+    padding: 6px 10px;
+  }
+  .bucket-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  .bucket-chip {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    background: #0c0e12;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 4px 10px 4px 8px;
+    font-size: 12px;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+    margin-top: 8px;
+  }
+  th, td {
+    text-align: left;
+    padding: 8px 10px;
+    border-bottom: 1px solid var(--border);
+  }
+  th { color: var(--muted); font-weight: 500; }
+  .mapping-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr auto;
+    gap: 8px;
+    margin-bottom: 8px;
+  }
+  .stat-row { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 8px; }
+  .stat {
+    background: #0c0e12;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 16px;
+    min-width: 110px;
+  }
+  .stat .n { font-size: 20px; font-weight: 600; }
+  .stat .l { font-size: 11px; color: var(--muted); }
+  .stat.ok .n { color: var(--ok); }
+  .stat.warn .n { color: var(--warn); }
+  .stat.err .n { color: var(--err); }
+  .msg { font-size: 12px; margin-top: 8px; }
+  .msg.err { color: var(--err); }
+  .msg.ok { color: var(--ok); }
+  a.report-link {
+    color: var(--accent);
+    text-decoration: none;
+    font-size: 13px;
+  }
+  a.report-link:hover { text-decoration: underline; }
+  .loading { color: var(--muted); font-size: 12px; }
+  .progress-track {
+    background: #0c0e12;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    height: 8px;
+    overflow: hidden;
+    margin-top: 12px;
+  }
+  .progress-fill {
+    height: 100%;
+    width: 0%;
+    background: var(--accent);
+    transition: width 0.2s ease;
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>Object Storage & MySQL Reconciler</h1>
+  <p>Read-only audit dashboard — nothing here deletes, modifies, or uploads objects.</p>
+</header>
+
+<main>
+  <section class="card">
+    <h2>Provider</h2>
+    <p class="hint">Which configured Object Storage provider every action below targets.</p>
+    <select id="providerSelect"><option value="">Loading…</option></select>
+  </section>
+
+  <section class="card">
+    <h2>Buckets</h2>
+    <p class="hint">Buckets visible to the configured credential.</p>
+    <button id="loadBuckets">Load buckets</button>
+    <div id="bucketList" class="bucket-list" style="margin-top:12px;"></div>
+    <div id="bucketMsg" class="msg"></div>
+  </section>
+
+  <section class="card">
+    <h2>Storage summary</h2>
+    <p class="hint">Object count and total size per bucket. Leave buckets blank to scan all.</p>
+    <div class="row">
+      <div>
+        <label>Buckets (comma-separated)</label><br />
+        <input type="text" id="summaryBuckets" placeholder="all buckets" size="30" />
+      </div>
+      <div>
+        <label>Prefix</label><br />
+        <input type="text" id="summaryPrefix" placeholder="images/" size="20" />
+      </div>
+      <div style="align-self:flex-end;">
+        <label><input type="checkbox" id="summaryExport" /> also save .xlsx report</label>
+      </div>
+      <button id="loadSummary" style="align-self:flex-end;">Get summary</button>
+    </div>
+    <div id="summaryMsg" class="msg"></div>
+    <table id="summaryTable" style="display:none;">
+      <thead><tr><th>Bucket</th><th>Objects</th><th>Size</th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <div id="summaryTotals" class="stat-row"></div>
+    <div id="summaryReport"></div>
+  </section>
+
+  <section class="card">
+    <h2>Auto reconciliation</h2>
+    <p class="hint">
+      Enter a database name and it discovers file-reference columns from the schema itself
+      (information_schema) instead of typing table/column mappings by hand. Best-effort: review
+      the discovered columns in the downloaded report before trusting it fully.
+    </p>
+    <div class="row">
+      <div>
+        <label>Database</label><br />
+        <input type="text" id="autoDatabase" placeholder="my_database" size="24" />
+      </div>
+      <div>
+        <label>Buckets (comma-separated)</label><br />
+        <input type="text" id="autoBuckets" placeholder="all buckets" size="30" />
+      </div>
+      <div>
+        <label>Prefix</label><br />
+        <input type="text" id="autoPrefix" placeholder="images/" size="20" />
+      </div>
+      <button id="runAutoRecon" style="align-self:flex-end;">Run</button>
+    </div>
+    <div id="autoMsg" class="msg"></div>
+    <div id="autoProgressWrap" style="display:none;">
+      <div class="progress-track"><div id="autoProgressBar" class="progress-fill"></div></div>
+      <div id="autoProgressLabel" class="loading"></div>
+    </div>
+    <div id="autoStats" class="stat-row"></div>
+    <div id="autoReport"></div>
+  </section>
+
+  <section class="card">
+    <h2>Reconciliation</h2>
+    <p class="hint">Match Object Storage against MySQL table/column file references.</p>
+    <div class="row">
+      <div>
+        <label>Buckets (comma-separated)</label><br />
+        <input type="text" id="reconBuckets" placeholder="all buckets" size="30" />
+      </div>
+      <div>
+        <label>Prefix</label><br />
+        <input type="text" id="reconPrefix" placeholder="images/" size="20" />
+      </div>
+    </div>
+
+    <label>Table / column mappings</label>
+    <div id="mappingRows" style="margin-top:6px;"></div>
+    <button class="secondary" id="addMapping" type="button">+ Add mapping</button>
+
+    <div class="row" style="margin-top:16px;">
+      <button id="runRecon">Run reconciliation</button>
+      <span id="reconLoading" class="loading" style="display:none;">Running… this can take a while for large buckets/tables.</span>
+    </div>
+    <div id="reconMsg" class="msg"></div>
+    <div id="reconStats" class="stat-row"></div>
+    <div id="reconReport"></div>
+  </section>
+</main>
+
+<script>
+  function formatBytes(bytes) {
+    if (!bytes) return "0 B";
+    const units = ["B", "KB", "MB", "GB", "TB"];
+    let i = 0, n = bytes;
+    while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+    return `${n.toFixed(n >= 10 || i === 0 ? 0 : 1)} ${units[i]}`;
+  }
+
+  async function fetchJson(url, opts) {
+    const res = await fetch(url, opts);
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok || body.status === false) {
+      throw new Error(body.message || `Request failed (${res.status})`);
+    }
+    return body;
+  }
+
+  // Reads a text/event-stream response (GET or POST — native EventSource can't do POST, so
+  // this parses SSE frames from a plain fetch body instead) and dispatches each `event: X` /
+  // `data: Y` frame to handlers[X](JSON.parse(Y)). Long scans (1TB+, many buckets/tables) can
+  // run for minutes; this is what lets the UI show live progress instead of one blocking
+  // request that looks hung and may hit a proxy/browser timeout.
+  async function fetchSse(url, opts, handlers) {
+    const res = await fetch(url, opts);
+    if (!res.ok || !res.body) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.message || `Request failed (${res.status})`);
+    }
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let sep;
+      while ((sep = buffer.indexOf("\n\n")) !== -1) {
+        const frame = buffer.slice(0, sep);
+        buffer = buffer.slice(sep + 2);
+        let event = "message";
+        let data = "";
+        for (const line of frame.split("\n")) {
+          if (line.startsWith("event:")) event = line.slice(6).trim();
+          else if (line.startsWith("data:")) data += line.slice(5).trim();
+        }
+        if (!data) continue; // heartbeat comment or empty frame
+        const parsed = JSON.parse(data);
+        if (event === "error") throw new Error(parsed.message || "Stream error");
+        handlers[event]?.(parsed);
+      }
+    }
+  }
+
+  function reportLink(filename) {
+    if (!filename) return "";
+    return `<a class="report-link" href="/reports/${encodeURIComponent(filename)}" target="_blank">Download ${filename}</a>`;
+  }
+
+  // --- Provider ---
+  // Which configured Object Storage provider (AWS/Wasabi/DigitalOcean/...) every other card
+  // targets. "" means "let the server use its configured default" — every endpoint below only
+  // adds &provider=... when a specific one is picked, so behavior is unchanged if left alone.
+  const providerSelect = document.getElementById("providerSelect");
+
+  function selectedProvider() {
+    return providerSelect.value || null;
+  }
+
+  async function loadProviders() {
+    try {
+      const { data } = await fetchJson("/storage/providers");
+      if (!data.providers.length) {
+        providerSelect.innerHTML = `<option value="">No provider configured</option>`;
+        return;
+      }
+      providerSelect.innerHTML = data.providers
+        .map((p) => `<option value="${p.key}"${p.isDefault ? " selected" : ""}>${p.label}${p.isDefault ? " (default)" : ""}</option>`)
+        .join("");
+    } catch (err) {
+      providerSelect.innerHTML = `<option value="">Failed to load providers</option>`;
+    }
+  }
+  loadProviders();
+
+  // --- Buckets ---
+  const loadBucketsBtn = document.getElementById("loadBuckets");
+  const bucketList = document.getElementById("bucketList");
+  const bucketMsg = document.getElementById("bucketMsg");
+
+  loadBucketsBtn.addEventListener("click", async () => {
+    bucketMsg.textContent = "Loading…";
+    bucketMsg.className = "msg";
+    bucketList.innerHTML = "";
+    try {
+      const bucketParams = new URLSearchParams();
+      if (selectedProvider()) bucketParams.set("provider", selectedProvider());
+      const { data } = await fetchJson(`/storage/buckets?${bucketParams.toString()}`);
+      bucketMsg.textContent = `${data.count} bucket(s)`;
+      bucketMsg.className = "msg ok";
+      bucketList.innerHTML = data.buckets
+        .map((b) => `<span class="bucket-chip">${b}</span>`)
+        .join("");
+    } catch (err) {
+      bucketMsg.textContent = err.message;
+      bucketMsg.className = "msg err";
+    }
+  });
+
+  // --- Storage summary ---
+  const loadSummaryBtn = document.getElementById("loadSummary");
+  const summaryMsg = document.getElementById("summaryMsg");
+  const summaryTable = document.getElementById("summaryTable");
+  const summaryTbody = summaryTable.querySelector("tbody");
+  const summaryTotals = document.getElementById("summaryTotals");
+  const summaryReport = document.getElementById("summaryReport");
+
+  loadSummaryBtn.addEventListener("click", async () => {
+    const buckets = document.getElementById("summaryBuckets").value.trim();
+    const prefix = document.getElementById("summaryPrefix").value.trim();
+    const exportReport = document.getElementById("summaryExport").checked;
+
+    const params = new URLSearchParams();
+    if (buckets) params.set("buckets", buckets);
+    if (prefix) params.set("prefix", prefix);
+    if (exportReport) params.set("export", "true");
+    if (selectedProvider()) params.set("provider", selectedProvider());
+
+    summaryMsg.textContent = "Starting…";
+    summaryMsg.className = "msg";
+    summaryTbody.innerHTML = "";
+    summaryTable.style.display = "table";
+    summaryTotals.innerHTML = "";
+    summaryReport.innerHTML = "";
+    loadSummaryBtn.disabled = true;
+
+    try {
+      await fetchSse(
+        `/storage/summary/stream?${params.toString()}`,
+        {},
+        {
+          progress: (d) => {
+            summaryMsg.textContent = `Scanning… ${d.completed}/${d.total} bucket(s) (${d.percent}%)`;
+            const row = document.createElement("tr");
+            row.innerHTML = `<td>${d.bucket}</td><td>${d.objectCount.toLocaleString()}</td><td>${formatBytes(d.totalSize)}</td>`;
+            if (d.error) row.title = d.error;
+            summaryTbody.appendChild(row);
+          },
+          done: (d) => {
+            summaryMsg.textContent = "";
+            summaryTable.style.display = d.buckets.length ? "table" : "none";
+            summaryTotals.innerHTML = `
+              <div class="stat"><div class="n">${d.bucketCount}</div><div class="l">buckets</div></div>
+              <div class="stat"><div class="n">${d.objectCount.toLocaleString()}</div><div class="l">objects</div></div>
+              <div class="stat"><div class="n">${formatBytes(d.totalSize)}</div><div class="l">total size</div></div>
+            `;
+            summaryReport.innerHTML = reportLink(d.reportFile);
+          },
+        },
+      );
+    } catch (err) {
+      summaryMsg.textContent = err.message;
+      summaryMsg.className = "msg err";
+    } finally {
+      loadSummaryBtn.disabled = false;
+    }
+  });
+
+  // --- Auto reconciliation ---
+  const runAutoBtn = document.getElementById("runAutoRecon");
+  const autoMsg = document.getElementById("autoMsg");
+  const autoProgressWrap = document.getElementById("autoProgressWrap");
+  const autoProgressBar = document.getElementById("autoProgressBar");
+  const autoProgressLabel = document.getElementById("autoProgressLabel");
+  const autoStats = document.getElementById("autoStats");
+  const autoReport = document.getElementById("autoReport");
+
+  runAutoBtn.addEventListener("click", async () => {
+    const database = document.getElementById("autoDatabase").value.trim();
+    const buckets = document.getElementById("autoBuckets").value.trim();
+    const prefix = document.getElementById("autoPrefix").value.trim();
+
+    if (!database) {
+      autoMsg.textContent = "Database name is required.";
+      autoMsg.className = "msg err";
+      return;
+    }
+
+    const params = new URLSearchParams();
+    params.set("database", database);
+    if (buckets) params.set("buckets", buckets);
+    if (prefix) params.set("prefix", prefix);
+    if (selectedProvider()) params.set("provider", selectedProvider());
+
+    autoMsg.textContent = "Discovering file-reference columns…";
+    autoMsg.className = "msg";
+    autoProgressWrap.style.display = "block";
+    autoProgressBar.style.width = "0%";
+    autoProgressLabel.textContent = "";
+    autoStats.innerHTML = "";
+    autoReport.innerHTML = "";
+    runAutoBtn.disabled = true;
+
+    try {
+      await fetchSse(
+        `/reconciliation/auto/stream?${params.toString()}`,
+        {},
+        {
+          discovered: (d) => {
+            autoMsg.textContent = `Found ${d.mappingCount} candidate column(s): ${d.mappings.join(", ")}`;
+          },
+          progress: (d) => {
+            const phaseLabel = d.phase === "database" ? "Reading database" : "Scanning storage";
+            autoProgressBar.style.width = `${d.percent}%`;
+            autoProgressLabel.textContent = `[${d.phase}] ${phaseLabel}: ${d.label} (${d.completed}/${d.total}, ${d.percent}%)${d.error ? " — " + d.error : ""}`;
+          },
+          done: (d) => {
+            autoMsg.textContent = "";
+            const s = d.summary;
+            autoStats.innerHTML = `
+              <div class="stat ok"><div class="n">${s.matchedCount.toLocaleString()}</div><div class="l">matched</div></div>
+              <div class="stat warn"><div class="n">${s.missingCount.toLocaleString()}</div><div class="l">missing</div></div>
+              <div class="stat err"><div class="n">${s.orphanCount.toLocaleString()}</div><div class="l">orphan</div></div>
+              <div class="stat"><div class="n">${s.databaseFileCount.toLocaleString()}</div><div class="l">db references</div></div>
+              <div class="stat"><div class="n">${s.storageObjectCount.toLocaleString()}</div><div class="l">storage objects</div></div>
+              <div class="stat"><div class="n">${(s.otherProviderCount || 0).toLocaleString()}</div><div class="l">skipped (other provider)</div></div>
+            `;
+            autoReport.innerHTML = reportLink(d.reportFile);
+          },
+        },
+      );
+    } catch (err) {
+      autoMsg.textContent = err.message;
+      autoMsg.className = "msg err";
+    } finally {
+      runAutoBtn.disabled = false;
+      autoProgressWrap.style.display = "none";
+    }
+  });
+
+  // --- Reconciliation ---
+  const mappingRows = document.getElementById("mappingRows");
+
+  function addMappingRow(values) {
+    const row = document.createElement("div");
+    row.className = "mapping-row";
+    row.innerHTML = `
+      <input type="text" placeholder="table" class="m-table" value="${values?.table ?? ""}" />
+      <input type="text" placeholder="column" class="m-column" value="${values?.column ?? ""}" />
+      <input type="text" placeholder="id column (default: id)" class="m-id" value="${values?.idColumn ?? ""}" />
+      <button type="button" class="danger">✕</button>
+    `;
+    row.querySelector("button").addEventListener("click", () => row.remove());
+    mappingRows.appendChild(row);
+  }
+
+  document.getElementById("addMapping").addEventListener("click", () => addMappingRow());
+  addMappingRow();
+
+  const runReconBtn = document.getElementById("runRecon");
+  const reconMsg = document.getElementById("reconMsg");
+  const reconStats = document.getElementById("reconStats");
+  const reconReport = document.getElementById("reconReport");
+  const reconLoading = document.getElementById("reconLoading");
+
+  runReconBtn.addEventListener("click", async () => {
+    const bucketsRaw = document.getElementById("reconBuckets").value.trim();
+    const prefix = document.getElementById("reconPrefix").value.trim();
+    const mappings = Array.from(mappingRows.querySelectorAll(".mapping-row"))
+      .map((row) => ({
+        table: row.querySelector(".m-table").value.trim(),
+        column: row.querySelector(".m-column").value.trim(),
+        idColumn: row.querySelector(".m-id").value.trim() || undefined,
+      }))
+      .filter((m) => m.table && m.column);
+
+    reconMsg.textContent = "";
+    reconStats.innerHTML = "";
+    reconReport.innerHTML = "";
+
+    if (mappings.length === 0) {
+      reconMsg.textContent = "At least one table/column mapping is required.";
+      reconMsg.className = "msg err";
+      return;
+    }
+
+    const body = { mappings };
+    if (bucketsRaw) body.buckets = bucketsRaw.split(",").map((b) => b.trim()).filter(Boolean);
+    if (prefix) body.prefix = prefix;
+    if (selectedProvider()) body.provider = selectedProvider();
+
+    const defaultLoadingText = reconLoading.textContent;
+    runReconBtn.disabled = true;
+    reconLoading.style.display = "inline";
+    try {
+      await fetchSse(
+        "/reconciliation/stream",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        },
+        {
+          progress: (d) => {
+            const phaseLabel = d.phase === "database" ? "Reading database" : "Scanning storage";
+            reconLoading.textContent = `${phaseLabel}: ${d.label} (${d.completed}/${d.total}, ${d.percent}%)${d.error ? " — " + d.error : ""}`;
+          },
+          done: (d) => {
+            const s = d.summary;
+            reconStats.innerHTML = `
+              <div class="stat ok"><div class="n">${s.matchedCount.toLocaleString()}</div><div class="l">matched</div></div>
+              <div class="stat warn"><div class="n">${s.missingCount.toLocaleString()}</div><div class="l">missing</div></div>
+              <div class="stat err"><div class="n">${s.orphanCount.toLocaleString()}</div><div class="l">orphan</div></div>
+              <div class="stat"><div class="n">${s.databaseFileCount.toLocaleString()}</div><div class="l">db references</div></div>
+              <div class="stat"><div class="n">${s.storageObjectCount.toLocaleString()}</div><div class="l">storage objects</div></div>
+              <div class="stat"><div class="n">${(s.otherProviderCount || 0).toLocaleString()}</div><div class="l">skipped (other provider)</div></div>
+            `;
+            reconReport.innerHTML = reportLink(d.reportFile);
+          },
+        },
+      );
+    } catch (err) {
+      reconMsg.textContent = err.message;
+      reconMsg.className = "msg err";
+    } finally {
+      runReconBtn.disabled = false;
+      reconLoading.style.display = "none";
+      reconLoading.textContent = defaultLoadingText;
+    }
+  });
+</script>
+</body>
+</html>
