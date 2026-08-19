@@ -1,5 +1,8 @@
+import re
+import threading
 import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import unquote, urlparse
 
 from app.config import env
@@ -8,8 +11,10 @@ from app.services.checkpoint_service import (
     clear_checkpoint,
     db_reference_from_dict,
     db_reference_to_dict,
-    load_checkpoint,
-    save_checkpoint,
+    load_bucket_checkpoint,
+    load_mapping_checkpoint,
+    save_bucket_checkpoint,
+    save_mapping_checkpoint,
     storage_object_from_dict,
     storage_object_to_dict,
 )
@@ -24,6 +29,7 @@ from app.types import (
     ReconciliationResult,
     ReconciliationSummary,
     StorageObject,
+    TableColumnMapping,
 )
 
 ProgressCallback = Callable[[str, int, int, str, str | None], None]
@@ -47,73 +53,236 @@ def _with_retries(fn: Callable[[], list]) -> list:
     raise last_error  # type: ignore[misc]
 
 
-def _collect_mapping_refs(mapping, database: str | None) -> list[DbFileReference]:
-    return list(fetch_file_references(mapping, database))
+_TICK_EVERY_MAPPING_ROWS = 5000  # matches mysql_service.BATCH_SIZE, so one tick per DB round-trip
+_TICK_EVERY_BUCKET_OBJECTS = 1000  # matches MAX_KEYS_PER_PAGE, so one tick per S3 page
 
 
-def _collect_bucket_objects(bucket: str, prefix: str | None, provider: str | None) -> list[StorageObject]:
-    return list(iterate_bucket_objects(bucket, prefix, provider))
+def _collect_mapping_refs(
+    mapping: TableColumnMapping,
+    database: str | None,
+    on_tick: Callable[[int], None] | None = None,
+) -> list[DbFileReference]:
+    refs: list[DbFileReference] = []
+    for ref in fetch_file_references(mapping, database):
+        refs.append(ref)
+        if on_tick and len(refs) % _TICK_EVERY_MAPPING_ROWS == 0:
+            on_tick(len(refs))
+    return refs
 
 
-def _provider_hosts() -> dict[str, str]:
-    """netloc (host[:port]) of each configured provider's endpoint, lowercased, keyed by provider key."""
-    return {
-        key: urlparse(config.endpoint).netloc.lower()
-        for key, config in env.s3_providers.items()
-        if config.endpoint
-    }
+def _collect_bucket_objects(
+    bucket: str,
+    prefix: str | None,
+    provider: str | None,
+    on_tick: Callable[[int], None] | None = None,
+) -> list[StorageObject]:
+    objects: list[StorageObject] = []
+    for obj in iterate_bucket_objects(bucket, prefix, provider):
+        objects.append(obj)
+        if on_tick and len(objects) % _TICK_EVERY_BUCKET_OBJECTS == 0:
+            on_tick(len(objects))
+    return objects
 
 
-def _belongs_to_other_provider(value: str, own_provider: str | None, provider_hosts: dict[str, str]) -> bool:
+_AWS_S3_HOST_RE = re.compile(r"(?:^|\.)s3(?:[.-][a-z0-9-]+)?\.amazonaws\.com$", re.I)
+
+
+def _split_s3_style_url(pathname: str, host: str) -> tuple[str, str] | None:
     """
-    True when `value` is a full URL whose host matches a *different* configured provider than the
-    one this scan is running against (e.g. a Wasabi URL left in a DB column that's now served from
-    DigitalOcean, from before a migration). Such a ref will never be found in the bucket being
-    scanned, on any provider, so it must be excluded up front rather than reported as "missing" —
-    otherwise every provider migration permanently pollutes the missing list with files that were
-    never lost, just moved. Bare paths/keys and URLs to unrecognized hosts have no provider
-    to contradict the scan, so they're left alone and checked as before.
+    Best-effort split of an S3-style URL's (host, path) into (bucket, key). Tries every
+    configured provider's endpoint first — respecting its actual path-style vs virtual-hosted
+    setting, the same distinction build_object_url uses — then falls back to AWS's well-known
+    *.amazonaws.com pattern even when AWS isn't a configured provider here, since DB columns
+    often keep old or foreign references to buckets this app was never given credentials for.
+    """
+    host_lower = host.lower()
+
+    for config in env.s3_providers.values():
+        if not config.endpoint:
+            continue
+        endpoint_host = urlparse(config.endpoint).netloc.lower()
+        if not endpoint_host:
+            continue
+        if config.force_path_style and host_lower == endpoint_host:
+            bucket, _, rest = pathname.partition("/")
+            if bucket:
+                return bucket, rest
+        elif not config.force_path_style and host_lower.endswith(f".{endpoint_host}"):
+            bucket = host_lower[: -(len(endpoint_host) + 1)]
+            if bucket:
+                return bucket, pathname
+
+    match = _AWS_S3_HOST_RE.search(host_lower)
+    if match:
+        prefix = host_lower[: match.start()].rstrip(".")
+        if prefix:
+            return prefix, pathname
+        bucket, _, rest = pathname.partition("/")
+        if bucket:
+            return bucket, rest
+
+    return None
+
+
+def _split_object_reference(value: str) -> tuple[str | None, str]:
+    """
+    Splits a raw DB column value into (bucket, key). Common variants seen in practice:
+     - a bare relative key, possibly with a leading slash the S3 key never has -> (None, key)
+     - a full URL through a CDN in front of the bucket (path == key, once host is stripped, since
+       there's no reliable way to recover a bucket name from an arbitrary CDN domain) -> (None, key)
+     - a full URL straight to a provider, bucket as the first path segment (path-style) or as a
+       subdomain (virtual-hosted) -> (bucket, key)
+    Bucket is what the caller uses to tell "genuinely missing from the buckets we checked" apart
+    from "this reference points at some other bucket/provider we were never asked to scan" —
+    those shouldn't be reported as missing at all, since we have no way to confirm or deny it.
     """
     trimmed = value.strip()
-    if not trimmed.lower().startswith(("http://", "https://")):
-        return False
-    try:
-        host = urlparse(trimmed).netloc.lower()
-    except ValueError:
-        return False
-
-    resolved_own = own_provider or env.s3_default_provider_key
-    own_host = provider_hosts.get(resolved_own) if resolved_own else None
-    if host == own_host:
-        return False
-    return any(key != resolved_own and host == other_host for key, other_host in provider_hosts.items())
-
-
-def _normalize_path(value: str, buckets: list[str]) -> str:
-    """
-    DB columns don't always store a raw object key. Common variants seen in practice:
-     - a leading slash the S3 key never has
-     - a full URL through a CDN in front of the bucket (path == key, once host is stripped)
-     - a full URL straight to the provider, with the bucket name as the first path segment
-    Bare filenames with no folder structure at all can't be recovered generically (the app
-    must be reconstructing the real key from other columns) — those are left as-is and will
-    legitimately show up as missing.
-    """
-    trimmed = value.strip()
 
     if not trimmed.lower().startswith(("http://", "https://")):
-        return trimmed.lstrip("/")
+        return None, trimmed.lstrip("/")
 
     try:
         parsed = urlparse(trimmed)
-        pathname = unquote(parsed.path).lstrip("/")
-        for bucket in buckets:
-            if pathname == bucket or pathname.startswith(f"{bucket}/"):
-                pathname = pathname[len(bucket) :].lstrip("/")
-                break
-        return pathname
     except ValueError:
-        return trimmed.lstrip("/")
+        return None, trimmed.lstrip("/")
+
+    pathname = unquote(parsed.path).lstrip("/")
+    split = _split_s3_style_url(pathname, parsed.netloc)
+    if split:
+        bucket, key = split
+        return bucket, key.lstrip("/")
+    return None, pathname
+
+
+def _fetch_mappings(
+    mappings: list[TableColumnMapping],
+    database: str | None,
+    checkpoint_id: str,
+    on_progress: ProgressCallback | None,
+) -> tuple[list[list[DbFileReference]], list[str | None]]:
+    """
+    Fetches every mapping's DB rows several at a time (bounded by STORAGE_SUMMARY_CONCURRENCY,
+    and by the MySQL pool's own connection limit) instead of one table at a time. Auto
+    reconciliation can easily discover 50-100+ candidate columns; running those fully
+    sequentially made that phase the single biggest chunk of a scan's wall time.
+    """
+    results: list[list[DbFileReference] | None] = [None] * len(mappings)
+    errors: list[str | None] = [None] * len(mappings)
+    completed = 0
+    lock = threading.Lock()
+
+    def work(i: int) -> None:
+        nonlocal completed
+        mapping = mappings[i]
+        mapping_key = f"{mapping.table}.{mapping.column}"
+        error: str | None = None
+        cached = load_mapping_checkpoint(checkpoint_id, mapping_key)
+        if cached is not None:
+            refs = [db_reference_from_dict(d) for d in cached]
+        else:
+            started_at = time.monotonic()
+
+            def on_tick(count: int, _key=mapping_key, _started=started_at) -> None:
+                # completed/total stay pinned to *fully finished* mappings (unchanged meaning
+                # for the progress bar's percent) — only the label ticks up live, so a table with
+                # millions of rows doesn't just sit frozen until it's entirely done.
+                if on_progress:
+                    elapsed = max(time.monotonic() - _started, 0.001)
+                    with lock:
+                        done_so_far = completed
+                    on_progress(
+                        "database",
+                        done_so_far,
+                        len(mappings),
+                        f"{_key} — {count:,} row(s) read so far ({count / elapsed:,.0f}/s)",
+                        None,
+                    )
+
+            try:
+                refs = _with_retries(lambda: _collect_mapping_refs(mapping, database, on_tick))
+                save_mapping_checkpoint(checkpoint_id, mapping_key, [db_reference_to_dict(r) for r in refs])
+            except Exception as err:  # noqa: BLE001
+                # One bad table/column (missing permission, renamed column, ...) shouldn't throw
+                # away everything already read from the other mappings.
+                refs = []
+                error = str(err)
+
+        results[i] = refs
+        errors[i] = error
+        with lock:
+            completed += 1
+            done = completed
+        if on_progress:
+            on_progress("database", done, len(mappings), mapping_key, error)
+
+    if mappings:
+        workers = min(env.storage_summary_concurrency, len(mappings))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            list(pool.map(work, range(len(mappings))))
+
+    return results, errors
+
+
+def _fetch_buckets(
+    buckets: list[str],
+    prefix: str | None,
+    provider: str | None,
+    checkpoint_id: str,
+    on_progress: ProgressCallback | None,
+) -> tuple[list[list[StorageObject]], list[str | None]]:
+    """Same idea as _fetch_mappings, for bucket listings — helps most when several buckets are
+    in scope; a single bucket's own pagination is still inherently sequential (S3 API design)."""
+    results: list[list[StorageObject] | None] = [None] * len(buckets)
+    errors: list[str | None] = [None] * len(buckets)
+    completed = 0
+    lock = threading.Lock()
+
+    def work(i: int) -> None:
+        nonlocal completed
+        bucket = buckets[i]
+        error: str | None = None
+        cached = load_bucket_checkpoint(checkpoint_id, bucket)
+        if cached is not None:
+            objs = [storage_object_from_dict(d) for d in cached]
+        else:
+            started_at = time.monotonic()
+
+            def on_tick(count: int, _bucket=bucket, _started=started_at) -> None:
+                if on_progress:
+                    elapsed = max(time.monotonic() - _started, 0.001)
+                    with lock:
+                        done_so_far = completed
+                    on_progress(
+                        "storage",
+                        done_so_far,
+                        len(buckets),
+                        f"{_bucket} — {count:,} object(s) scanned so far ({count / elapsed:,.0f}/s)",
+                        None,
+                    )
+
+            try:
+                objs = _with_retries(lambda: _collect_bucket_objects(bucket, prefix, provider, on_tick))
+                save_bucket_checkpoint(checkpoint_id, bucket, [storage_object_to_dict(o) for o in objs])
+            except Exception as err:  # noqa: BLE001
+                objs = []
+                message = str(err)
+                if not is_region_mismatch_error(message):
+                    error = message
+
+        results[i] = objs
+        errors[i] = error
+        with lock:
+            completed += 1
+            done = completed
+        if on_progress:
+            on_progress("storage", done, len(buckets), bucket, error)
+
+    if buckets:
+        workers = min(env.storage_summary_concurrency, len(buckets))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            list(pool.map(work, range(len(buckets))))
+
+    return results, errors
 
 
 def run_reconciliation(
@@ -125,76 +294,49 @@ def run_reconciliation(
     inside it is blocking, so keeping it off the event loop is what keeps the server responsive
     (heartbeats, other requests) while a scan is in progress, however long it takes.
 
-    Each bucket/mapping is retried a few times on transient failure; if it still fails, that one
-    item is reported as an error but every other bucket/mapping that already succeeded is kept in
-    a checkpoint file (reports/.checkpoints/<id>.json). Re-running the exact same request (same
-    buckets/mappings/prefix/database/provider) skips everything the checkpoint already has and
-    only (re)does what's missing — so a scan that dies partway through a 1TB bucket doesn't mean
-    starting over from zero. The checkpoint is deleted once a run finishes with no errors at all.
+    Mapping fetches and bucket scans each run several at a time (see _fetch_mappings /
+    _fetch_buckets) instead of one at a time. Each is also retried a few times on transient
+    failure; if one still fails, it's reported as an error but every other bucket/mapping that
+    already succeeded is kept in a checkpoint (reports/.checkpoints/<id>/ — one small file per
+    finished item). Re-running the exact same request (same buckets/mappings/prefix/database/
+    provider) skips everything the checkpoint already has and only (re)does what's missing — so
+    a scan that dies partway through doesn't mean starting over from zero. The checkpoint is
+    deleted once a run finishes with no errors at all.
     """
     checkpoint_id = checkpoint_id_for(request)
-    checkpoint = load_checkpoint(checkpoint_id)
-    any_error = False
 
     buckets = request.buckets if request.buckets is not None else list_buckets(request.provider)
+
+    mapping_results, mapping_errors = _fetch_mappings(request.mappings, request.database, checkpoint_id, on_progress)
+    any_error = any(e is not None for e in mapping_errors)
+
     db_files: dict[str, DbFileReference] = {}
     database_file_count = 0
     other_provider_count = 0
-    provider_hosts = _provider_hosts()
-
-    for i, mapping in enumerate(request.mappings):
-        mapping_key = f"{mapping.table}.{mapping.column}"
-        mapping_error: str | None = None
-        cached = checkpoint["mappings"].get(mapping_key)
-        if cached is not None:
-            refs = [db_reference_from_dict(d) for d in cached]
-        else:
-            try:
-                refs = _with_retries(lambda: _collect_mapping_refs(mapping, request.database))
-                checkpoint["mappings"][mapping_key] = [db_reference_to_dict(r) for r in refs]
-                save_checkpoint(checkpoint_id, checkpoint)
-            except Exception as error:  # noqa: BLE001
-                # One bad table/column (missing permission, renamed column, ...) shouldn't throw
-                # away everything already read from the other mappings.
-                refs = []
-                mapping_error = str(error)
-                any_error = True
-
-        for ref in refs:
-            if _belongs_to_other_provider(ref.value, request.provider, provider_hosts):
+    for refs in mapping_results:
+        for ref in refs or []:
+            database_file_count += 1
+            url_bucket, key = _split_object_reference(ref.value)
+            if url_bucket is not None and url_bucket not in buckets:
+                # Names a real bucket, just not one of the ones we're scanning right now (a
+                # different provider/account, or simply out of scope for this run) — we have no
+                # way to confirm or deny it exists, so it's excluded rather than reported missing.
                 other_provider_count += 1
                 continue
-            database_file_count += 1
-            normalized = _normalize_path(ref.value, buckets)
-            db_files.setdefault(normalized, ref)
-        if on_progress:
-            on_progress("database", i + 1, len(request.mappings), mapping_key, mapping_error)
+            db_files.setdefault(key, ref)
+
+    bucket_results, bucket_errors = _fetch_buckets(
+        buckets, request.prefix, request.provider, checkpoint_id, on_progress
+    )
+    if any(e is not None for e in bucket_errors):
+        any_error = True
 
     storage_objects: dict[str, StorageObject] = {}
     storage_object_count = 0
-
-    for i, bucket in enumerate(buckets):
-        bucket_error: str | None = None
-        cached = checkpoint["buckets"].get(bucket)
-        if cached is not None:
-            objs = [storage_object_from_dict(d) for d in cached]
-        else:
-            try:
-                objs = _with_retries(lambda: _collect_bucket_objects(bucket, request.prefix, request.provider))
-                checkpoint["buckets"][bucket] = [storage_object_to_dict(o) for o in objs]
-                save_checkpoint(checkpoint_id, checkpoint)
-            except Exception as error:  # noqa: BLE001
-                objs = []
-                message = str(error)
-                if not is_region_mismatch_error(message):
-                    bucket_error = message
-                    any_error = True
-
-        for obj in objs:
+    for objs in bucket_results:
+        for obj in objs or []:
             storage_object_count += 1
             storage_objects[obj.key] = obj
-        if on_progress:
-            on_progress("storage", i + 1, len(buckets), bucket, bucket_error)
 
     if not any_error:
         clear_checkpoint(checkpoint_id)

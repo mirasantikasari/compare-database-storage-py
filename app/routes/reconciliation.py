@@ -64,7 +64,7 @@ async def reconciliation_auto_stream(
                     "phase": phase,
                     "completed": completed,
                     "total": total,
-                    "percent": round((completed / total) * 100),
+                    "percent": round((completed / total) * 100) if total else 100,
                     "label": label,
                     "error": error,
                     "reportFile": report_file,
@@ -80,7 +80,7 @@ async def reconciliation_auto_stream(
         )
         result = run_reconciliation(request, on_progress)
 
-        generate_reconciliation_report(result, report_file, provider)
+        generate_reconciliation_report(result, report_file, provider, on_progress)
         emit(
             "done",
             {
@@ -137,7 +137,7 @@ async def reconciliation_stream(body: ReconciliationBody):
         )
         result = run_reconciliation(request, on_progress)
 
-        generate_reconciliation_report(result, report_file, body.provider)
+        generate_reconciliation_report(result, report_file, body.provider, on_progress)
         emit(
             "done",
             {

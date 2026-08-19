@@ -1,11 +1,15 @@
 import os
 import re
 import tempfile
+import time
 import uuid
+from collections.abc import Callable
 from datetime import date, datetime
 
 from openpyxl import Workbook
+from openpyxl.cell import WriteOnlyCell
 from openpyxl.styles import Font
+from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.worksheet import Worksheet
 
 from app.config import env
@@ -14,6 +18,17 @@ from app.types import ReconciliationResult, StorageSummary
 
 _BOLD = Font(bold=True)
 _RED = Font(color="FFCC0000")
+# Applied directly instead of `cell.style = "Hyperlink"` — the named-style path re-resolves the
+# style from the workbook's style registry on every single cell, which measurably adds up across
+# tens/hundreds of thousands of rows. A plain Font gets the same visual result (and still a real,
+# clickable hyperlink) for a fraction of the per-cell cost.
+_HYPERLINK_FONT = Font(color="0563C1", underline="single")
+
+# How often generate_reconciliation_report reports progress while writing rows — frequent enough
+# to feel alive on a huge report, not so frequent that the progress calls themselves add overhead.
+_REPORT_TICK_EVERY_ROWS = 2000
+
+ReportProgressCallback = Callable[[str, int, int, str, str | None], None]
 
 
 def _format_bytes(num_bytes: float) -> str:
@@ -125,58 +140,106 @@ def generate_storage_report(summary: StorageSummary, file_name: str | None = Non
     return _save_workbook(workbook, file_name)
 
 
+def _header_row(ws, headers: list[str]) -> list[WriteOnlyCell]:
+    cells = []
+    for h in headers:
+        cell = WriteOnlyCell(ws, value=h)
+        cell.font = _BOLD
+        cells.append(cell)
+    return cells
+
+
+def _hyperlink_cell(ws, url: str) -> WriteOnlyCell:
+    cell = WriteOnlyCell(ws, value=url)
+    cell.hyperlink = url
+    cell.font = _HYPERLINK_FONT
+    return cell
+
+
 def generate_reconciliation_report(
     result: ReconciliationResult,
     file_name: str | None = None,
     provider: str | None = None,
+    on_progress: ReportProgressCallback | None = None,
 ) -> str:
+    """
+    Uses openpyxl's write_only mode: a normal Workbook re-registers a cell's style against the
+    workbook's shared style table on every assignment, which gets measurably slower as that
+    table grows — noticeable well before "thousands and thousands of objects" territory, since
+    every Matched/Orphan row sets a font for its hyperlink. write_only sidesteps that (several
+    times faster in practice), at the cost of being append-only — no going back to re-read or
+    restyle a row after it's written, which this function never needs to do anyway.
+    """
     file_name = file_name or build_report_file_name(["reconciliation"])
-    workbook = Workbook()
+    workbook = Workbook(write_only=True)
 
-    matched_sheet = workbook.active
-    matched_sheet.title = "Matched"
-    matched_sheet.append(["Path", "Bucket", "Size (MB)", "Last Modified", "Table", "Column", "Row ID"])
+    total_rows = len(result.matched) + len(result.missing) + len(result.orphan)
+    written = 0
+    started_at = time.monotonic()
+
+    def tick(sheet_label: str) -> None:
+        nonlocal written
+        written += 1
+        if on_progress and written % _REPORT_TICK_EVERY_ROWS == 0:
+            elapsed = max(time.monotonic() - started_at, 0.001)
+            on_progress(
+                "report",
+                written,
+                total_rows,
+                f"Writing {sheet_label} sheet — {written:,}/{total_rows:,} row(s) "
+                f"({written / elapsed:,.0f}/s)",
+                None,
+            )
+
+    matched_sheet = workbook.create_sheet("Matched")
     for idx, width in enumerate([60, 20, 14, 22, 16, 16, 12], start=1):
-        matched_sheet.column_dimensions[matched_sheet.cell(row=1, column=idx).column_letter].width = width
+        matched_sheet.column_dimensions[get_column_letter(idx)].width = width
+    matched_sheet.append(
+        _header_row(matched_sheet, ["Path", "Bucket", "Size (MB)", "Last Modified", "Table", "Column", "Row ID"])
+    )
     for file in result.matched:
         url = build_object_url(provider, file.bucket, file.path)
         matched_sheet.append(
-            [url, file.bucket, _mb(file.size), _naive(file.last_modified), file.table, file.column, file.id]
+            [
+                _hyperlink_cell(matched_sheet, url),
+                file.bucket,
+                _mb(file.size),
+                _naive(file.last_modified),
+                file.table,
+                file.column,
+                file.id,
+            ]
         )
-        cell = matched_sheet.cell(row=matched_sheet.max_row, column=1)
-        cell.hyperlink = url
-        cell.style = "Hyperlink"
-    _style_header_row(matched_sheet)
+        tick("Matched")
 
     missing_sheet = workbook.create_sheet("Missing")
-    missing_sheet.append(["Path", "Table", "Column", "Row ID"])
     for idx, width in enumerate([60, 16, 16, 12], start=1):
-        missing_sheet.column_dimensions[missing_sheet.cell(row=1, column=idx).column_letter].width = width
+        missing_sheet.column_dimensions[get_column_letter(idx)].width = width
+    missing_sheet.append(_header_row(missing_sheet, ["Path", "Table", "Column", "Row ID"]))
     for file in result.missing:
         # A missing file was never found in storage, so this link (when we have enough info to
         # build one at all) points at where it *would* be — it will 404, but that's still more
         # useful for tracking it down than a bare relative key.
         if file.bucket:
             url = build_object_url(provider, file.bucket, file.path)
-            missing_sheet.append([url, file.table, file.column, file.id])
-            cell = missing_sheet.cell(row=missing_sheet.max_row, column=1)
-            cell.hyperlink = url
-            cell.style = "Hyperlink"
+            missing_sheet.append([_hyperlink_cell(missing_sheet, url), file.table, file.column, file.id])
         else:
             missing_sheet.append([file.path, file.table, file.column, file.id])
-    _style_header_row(missing_sheet)
+        tick("Missing")
 
     orphan_sheet = workbook.create_sheet("Orphan")
-    orphan_sheet.append(["Path", "Bucket", "Size (MB)", "Last Modified"])
     for idx, width in enumerate([60, 20, 14, 22], start=1):
-        orphan_sheet.column_dimensions[orphan_sheet.cell(row=1, column=idx).column_letter].width = width
+        orphan_sheet.column_dimensions[get_column_letter(idx)].width = width
+    orphan_sheet.append(_header_row(orphan_sheet, ["Path", "Bucket", "Size (MB)", "Last Modified"]))
     for file in result.orphan:
         url = build_object_url(provider, file.bucket, file.path)
-        orphan_sheet.append([url, file.bucket, _mb(file.size), _naive(file.last_modified)])
-        cell = orphan_sheet.cell(row=orphan_sheet.max_row, column=1)
-        cell.hyperlink = url
-        cell.style = "Hyperlink"
-    _style_header_row(orphan_sheet)
+        orphan_sheet.append(
+            [_hyperlink_cell(orphan_sheet, url), file.bucket, _mb(file.size), _naive(file.last_modified)]
+        )
+        tick("Orphan")
+
+    if on_progress:
+        on_progress("report", total_rows, total_rows, "Saving workbook to disk…", None)
 
     # Missing files were never found in storage, so they have no size to report; matched +
     # orphan together account for every object actually seen in storage, so their sizes sum to
@@ -185,9 +248,9 @@ def generate_reconciliation_report(
     orphan_size = sum(f.size for f in result.orphan)
 
     summary_sheet = workbook.create_sheet("Summary")
-    summary_sheet.append(["Metric", "Count", "Size (GB)"])
     for idx, width in enumerate([30, 16, 16], start=1):
-        summary_sheet.column_dimensions[summary_sheet.cell(row=1, column=idx).column_letter].width = width
+        summary_sheet.column_dimensions[get_column_letter(idx)].width = width
+    summary_sheet.append(_header_row(summary_sheet, ["Metric", "Count", "Size (GB)"]))
     summary_sheet.append(["Matched", result.summary.matched_count, _gb(matched_size)])
     summary_sheet.append(["Missing", result.summary.missing_count, ""])
     summary_sheet.append(["Orphan", result.summary.orphan_count, _gb(orphan_size)])
@@ -196,6 +259,5 @@ def generate_reconciliation_report(
         ["Object Storage Objects", result.summary.storage_object_count, _gb(matched_size + orphan_size)]
     )
     summary_sheet.append(["Skipped (other provider)", result.summary.other_provider_count, ""])
-    _style_header_row(summary_sheet)
 
     return _save_workbook(workbook, file_name)
