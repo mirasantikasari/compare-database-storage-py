@@ -67,6 +67,7 @@ class MatchedFile:
     column: str
     id: str | int | None
     last_modified: datetime | None = None
+    raw_value: str | None = None
 
 
 @dataclass
@@ -76,6 +77,7 @@ class MissingFile:
     column: str
     id: str | int | None
     bucket: str | None = None
+    raw_value: str | None = None
 
 
 @dataclass
@@ -94,6 +96,9 @@ class ReconciliationSummary:
     database_file_count: int
     storage_object_count: int
     other_provider_count: int = 0
+    different_provider_count: int = 0
+    protected_count: int = 0
+    content_reference_count: int = 0
 
 
 @dataclass
@@ -102,3 +107,38 @@ class ReconciliationResult:
     missing: list[MissingFile]
     orphan: list[OrphanFile]
     summary: ReconciliationSummary
+    # An object that *would* be orphan by the plain file-column check, but whose key was also
+    # found embedded inside a rich-text/JSON column (content_mappings) — e.g. a CKEditor/CKFinder
+    # upload referenced only as an <img> inside a lesson's HTML body, never as its own dedicated
+    # path column. Kept out of `orphan` so a caller who deletes straight off that list never
+    # removes something still in use; kept here (rather than dropped) so a reviewer can see why.
+    protected: list[OrphanFile] = field(default_factory=list)
+
+
+@dataclass
+class CleanupCandidate:
+    path: str
+    bucket: str
+    size: int
+    last_modified: datetime | None = None
+
+
+@dataclass
+class DoCleanupSummary:
+    candidate_count: int
+    protected_count: int
+    orphan_count: int
+    matched_count: int
+    missing_count: int
+    database_file_count: int
+    storage_object_count: int
+    content_reference_count: int
+    other_provider_count: int = 0
+    different_provider_count: int = 0
+
+
+@dataclass
+class DoCleanupResult:
+    candidates: list[CleanupCandidate]
+    protected: list[CleanupCandidate]
+    summary: DoCleanupSummary

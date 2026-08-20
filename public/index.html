@@ -213,7 +213,10 @@
     <p class="hint">
       Enter a database name and it discovers file-reference columns from the schema itself
       (information_schema) instead of typing table/column mappings by hand. Best-effort: review
-      the discovered columns in the downloaded report before trusting it fully.
+      the discovered columns in the downloaded report before trusting it fully. Every TEXT/JSON
+      column is also scanned for embedded Object Storage URLs (e.g. CKEditor/CKFinder uploads
+      referenced only inside rich content) — anything found there is moved out of Orphan into
+      Protected, so Orphan stays a safer basis for anything you plan to delete outside this tool.
     </p>
     <div class="row">
       <div>
@@ -240,9 +243,51 @@
   </section>
 
   <section class="card">
-    <h2>Reconciliation</h2>
-    <p class="hint">Match Object Storage against MySQL table/column file references.</p>
+    <h2>DO cleanup candidates</h2>
+    <p class="hint">
+      Same auto-discovery as above, plus a scan of every TEXT/LONGTEXT column for Object Storage
+      URLs embedded inline (e.g. CKEditor/CKFinder uploads referenced only inside HTML content).
+      Produces an .xlsx listing which orphaned objects are safe cleanup candidates vs. which are
+      protected because they're still referenced from inside rich-text content.
+      Read-only — nothing is deleted.
+    </p>
     <div class="row">
+      <div>
+        <label>Database</label><br />
+        <input type="text" id="cleanupDatabase" placeholder="my_database" size="24" />
+      </div>
+      <div>
+        <label>Buckets (comma-separated)</label><br />
+        <input type="text" id="cleanupBuckets" placeholder="all buckets" size="30" />
+      </div>
+      <div>
+        <label>Prefix</label><br />
+        <input type="text" id="cleanupPrefix" placeholder="images/" size="20" />
+      </div>
+      <button id="runCleanup" style="align-self:flex-end;">Run</button>
+    </div>
+    <div id="cleanupMsg" class="msg"></div>
+    <div id="cleanupProgressWrap" style="display:none;">
+      <div class="progress-track"><div id="cleanupProgressBar" class="progress-fill"></div></div>
+      <div id="cleanupProgressLabel" class="loading"></div>
+    </div>
+    <div id="cleanupStats" class="stat-row"></div>
+    <div id="cleanupReport"></div>
+  </section>
+
+  <section class="card">
+    <h2>Reconciliation</h2>
+    <p class="hint">
+      Match Object Storage against hand-typed MySQL table/column file references. Database is
+      optional — when given, every TEXT/JSON column in it is also scanned for embedded Object
+      Storage URLs, so Orphan doesn't wrongly include a file still referenced only inside
+      rich-text/CKEditor content.
+    </p>
+    <div class="row">
+      <div>
+        <label>Database (optional)</label><br />
+        <input type="text" id="reconDatabase" placeholder="my_database" size="24" />
+      </div>
       <div>
         <label>Buckets (comma-separated)</label><br />
         <input type="text" id="reconBuckets" placeholder="all buckets" size="30" />
@@ -476,12 +521,11 @@
         {},
         {
           discovered: (d) => {
-            autoMsg.textContent = `Found ${d.mappingCount} candidate column(s): ${d.mappings.join(", ")}`;
+            autoMsg.textContent = `Found ${d.mappingCount} candidate column(s): ${d.mappings.join(", ")} — plus ${d.contentMappingCount} rich-text/JSON column(s) to protect against`;
           },
           progress: (d) => {
-            const phaseLabel = d.phase === "database" ? "Reading database" : "Scanning storage";
             autoProgressBar.style.width = `${d.percent}%`;
-            autoProgressLabel.textContent = `[${d.phase}] ${phaseLabel}: ${d.label} (${d.completed}/${d.total}, ${d.percent}%)${d.error ? " — " + d.error : ""}`;
+            autoProgressLabel.textContent = `[${d.phase}] ${phaseLabel(d.phase)}: ${d.label} (${d.completed}/${d.total}, ${d.percent}%)${d.error ? " — " + d.error : ""}`;
           },
           done: (d) => {
             autoMsg.textContent = "";
@@ -489,10 +533,12 @@
             autoStats.innerHTML = `
               <div class="stat ok"><div class="n">${s.matchedCount.toLocaleString()}</div><div class="l">matched</div></div>
               <div class="stat warn"><div class="n">${s.missingCount.toLocaleString()}</div><div class="l">missing</div></div>
-              <div class="stat err"><div class="n">${s.orphanCount.toLocaleString()}</div><div class="l">orphan</div></div>
+              <div class="stat err"><div class="n">${s.orphanCount.toLocaleString()}</div><div class="l">orphan (confirmed unused)</div></div>
+              <div class="stat ok"><div class="n">${(s.protectedCount || 0).toLocaleString()}</div><div class="l">protected (in content)</div></div>
               <div class="stat"><div class="n">${s.databaseFileCount.toLocaleString()}</div><div class="l">db references</div></div>
               <div class="stat"><div class="n">${s.storageObjectCount.toLocaleString()}</div><div class="l">storage objects</div></div>
               <div class="stat"><div class="n">${(s.otherProviderCount || 0).toLocaleString()}</div><div class="l">skipped (other provider)</div></div>
+              <div class="stat"><div class="n">${(s.differentProviderCount || 0).toLocaleString()}</div><div class="l">skipped (different provider host)</div></div>
             `;
             autoReport.innerHTML = reportLink(d.reportFile);
           },
@@ -504,6 +550,86 @@
     } finally {
       runAutoBtn.disabled = false;
       autoProgressWrap.style.display = "none";
+    }
+  });
+
+  // --- DO cleanup candidates ---
+  const runCleanupBtn = document.getElementById("runCleanup");
+  const cleanupMsg = document.getElementById("cleanupMsg");
+  const cleanupProgressWrap = document.getElementById("cleanupProgressWrap");
+  const cleanupProgressBar = document.getElementById("cleanupProgressBar");
+  const cleanupProgressLabel = document.getElementById("cleanupProgressLabel");
+  const cleanupStats = document.getElementById("cleanupStats");
+  const cleanupReport = document.getElementById("cleanupReport");
+
+  function phaseLabel(phase) {
+    if (phase === "database") return "Reading file-reference columns";
+    if (phase === "content") return "Scanning rich-text content";
+    if (phase === "storage") return "Scanning storage";
+    return "Working";
+  }
+
+  runCleanupBtn.addEventListener("click", async () => {
+    const database = document.getElementById("cleanupDatabase").value.trim();
+    const buckets = document.getElementById("cleanupBuckets").value.trim();
+    const prefix = document.getElementById("cleanupPrefix").value.trim();
+
+    if (!database) {
+      cleanupMsg.textContent = "Database name is required.";
+      cleanupMsg.className = "msg err";
+      return;
+    }
+
+    const params = new URLSearchParams();
+    params.set("database", database);
+    if (buckets) params.set("buckets", buckets);
+    if (prefix) params.set("prefix", prefix);
+    if (selectedProvider()) params.set("provider", selectedProvider());
+
+    cleanupMsg.textContent = "Discovering file-reference and rich-text columns…";
+    cleanupMsg.className = "msg";
+    cleanupProgressWrap.style.display = "block";
+    cleanupProgressBar.style.width = "0%";
+    cleanupProgressLabel.textContent = "";
+    cleanupStats.innerHTML = "";
+    cleanupReport.innerHTML = "";
+    runCleanupBtn.disabled = true;
+
+    try {
+      await fetchSse(
+        `/reconciliation/do-cleanup/stream?${params.toString()}`,
+        {},
+        {
+          discovered: (d) => {
+            cleanupMsg.textContent = `Found ${d.fileMappingCount} file column(s) and ${d.contentMappingCount} rich-text column(s)`;
+          },
+          progress: (d) => {
+            cleanupProgressBar.style.width = `${d.percent}%`;
+            cleanupProgressLabel.textContent = `[${d.phase}] ${phaseLabel(d.phase)}: ${d.label} (${d.completed}/${d.total}, ${d.percent}%)${d.error ? " — " + d.error : ""}`;
+          },
+          done: (d) => {
+            cleanupMsg.textContent = "";
+            const s = d.summary;
+            cleanupStats.innerHTML = `
+              <div class="stat err"><div class="n">${s.candidateCount.toLocaleString()}</div><div class="l">cleanup candidates</div></div>
+              <div class="stat ok"><div class="n">${s.protectedCount.toLocaleString()}</div><div class="l">protected (in content)</div></div>
+              <div class="stat"><div class="n">${s.orphanCount.toLocaleString()}</div><div class="l">total orphan</div></div>
+              <div class="stat"><div class="n">${s.matchedCount.toLocaleString()}</div><div class="l">matched</div></div>
+              <div class="stat warn"><div class="n">${s.missingCount.toLocaleString()}</div><div class="l">missing</div></div>
+              <div class="stat"><div class="n">${s.contentReferenceCount.toLocaleString()}</div><div class="l">rich-text rows scanned</div></div>
+              <div class="stat"><div class="n">${(s.otherProviderCount || 0).toLocaleString()}</div><div class="l">skipped (other provider)</div></div>
+              <div class="stat"><div class="n">${(s.differentProviderCount || 0).toLocaleString()}</div><div class="l">skipped (different provider host)</div></div>
+            `;
+            cleanupReport.innerHTML = reportLink(d.reportFile);
+          },
+        },
+      );
+    } catch (err) {
+      cleanupMsg.textContent = err.message;
+      cleanupMsg.className = "msg err";
+    } finally {
+      runCleanupBtn.disabled = false;
+      cleanupProgressWrap.style.display = "none";
     }
   });
 
@@ -533,6 +659,7 @@
   const reconLoading = document.getElementById("reconLoading");
 
   runReconBtn.addEventListener("click", async () => {
+    const database = document.getElementById("reconDatabase").value.trim();
     const bucketsRaw = document.getElementById("reconBuckets").value.trim();
     const prefix = document.getElementById("reconPrefix").value.trim();
     const mappings = Array.from(mappingRows.querySelectorAll(".mapping-row"))
@@ -554,6 +681,7 @@
     }
 
     const body = { mappings };
+    if (database) body.database = database;
     if (bucketsRaw) body.buckets = bucketsRaw.split(",").map((b) => b.trim()).filter(Boolean);
     if (prefix) body.prefix = prefix;
     if (selectedProvider()) body.provider = selectedProvider();
@@ -571,18 +699,19 @@
         },
         {
           progress: (d) => {
-            const phaseLabel = d.phase === "database" ? "Reading database" : "Scanning storage";
-            reconLoading.textContent = `${phaseLabel}: ${d.label} (${d.completed}/${d.total}, ${d.percent}%)${d.error ? " — " + d.error : ""}`;
+            reconLoading.textContent = `[${d.phase}] ${phaseLabel(d.phase)}: ${d.label} (${d.completed}/${d.total}, ${d.percent}%)${d.error ? " — " + d.error : ""}`;
           },
           done: (d) => {
             const s = d.summary;
             reconStats.innerHTML = `
               <div class="stat ok"><div class="n">${s.matchedCount.toLocaleString()}</div><div class="l">matched</div></div>
               <div class="stat warn"><div class="n">${s.missingCount.toLocaleString()}</div><div class="l">missing</div></div>
-              <div class="stat err"><div class="n">${s.orphanCount.toLocaleString()}</div><div class="l">orphan</div></div>
+              <div class="stat err"><div class="n">${s.orphanCount.toLocaleString()}</div><div class="l">orphan (confirmed unused)</div></div>
+              <div class="stat ok"><div class="n">${(s.protectedCount || 0).toLocaleString()}</div><div class="l">protected (in content)</div></div>
               <div class="stat"><div class="n">${s.databaseFileCount.toLocaleString()}</div><div class="l">db references</div></div>
               <div class="stat"><div class="n">${s.storageObjectCount.toLocaleString()}</div><div class="l">storage objects</div></div>
               <div class="stat"><div class="n">${(s.otherProviderCount || 0).toLocaleString()}</div><div class="l">skipped (other provider)</div></div>
+              <div class="stat"><div class="n">${(s.differentProviderCount || 0).toLocaleString()}</div><div class="l">skipped (different provider host)</div></div>
             `;
             reconReport.innerHTML = reportLink(d.reportFile);
           },

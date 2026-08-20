@@ -82,6 +82,18 @@ def save_mapping_checkpoint(checkpoint_id: str, mapping_key: str, refs: list[dic
     _write_json_atomic(_item_path(checkpoint_id, "mapping", mapping_key), refs)
 
 
+def load_content_checkpoint(checkpoint_id: str, mapping_key: str) -> dict | None:
+    """Stores only the (small) set of keys extracted from a rich-text column, plus how many rows
+    were scanned to find them — never the raw HTML/text itself, which would otherwise bloat the
+    checkpoint by however large that column's content actually is."""
+    data = _read_json(_item_path(checkpoint_id, "content", mapping_key))
+    return data if data is None else {"keys": data.get("keys", []), "rowsScanned": data.get("rowsScanned", 0)}
+
+
+def save_content_checkpoint(checkpoint_id: str, mapping_key: str, keys: list[str], rows_scanned: int) -> None:
+    _write_json_atomic(_item_path(checkpoint_id, "content", mapping_key), {"keys": keys, "rowsScanned": rows_scanned})
+
+
 def load_bucket_checkpoint(checkpoint_id: str, bucket: str) -> list[dict] | None:
     return _read_json(_item_path(checkpoint_id, "bucket", bucket))
 

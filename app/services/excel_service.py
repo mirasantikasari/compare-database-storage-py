@@ -14,7 +14,7 @@ from openpyxl.worksheet.worksheet import Worksheet
 
 from app.config import env
 from app.providers.s3_provider import build_object_url
-from app.types import ReconciliationResult, StorageSummary
+from app.types import DoCleanupResult, ReconciliationResult, StorageSummary
 
 _BOLD = Font(bold=True)
 _RED = Font(color="FFCC0000")
@@ -156,6 +156,24 @@ def _hyperlink_cell(ws, url: str) -> WriteOnlyCell:
     return cell
 
 
+def _raw_value_cell(ws, raw_value: str | None, fallback_url: str | None) -> WriteOnlyCell:
+    """
+    Displays exactly what's stored in the DB column (`raw_value`) — never a URL rebuilt from the
+    parsed bucket/key, which can look nothing like the original (different host, different
+    path-vs-virtual-hosted style, a CDN domain the app doesn't even know about) even though it
+    points at the same object. `fallback_url` only supplies the *clickable* href: the raw value
+    itself when it's already a full URL, otherwise a browsable link built from the resolved
+    bucket/key so the cell stays clickable — the displayed text is untouched either way.
+    """
+    display = raw_value if raw_value is not None else (fallback_url or "")
+    href = raw_value if raw_value and raw_value.lower().startswith(("http://", "https://")) else fallback_url
+    cell = WriteOnlyCell(ws, value=display)
+    if href:
+        cell.hyperlink = href
+        cell.font = _HYPERLINK_FONT
+    return cell
+
+
 def generate_reconciliation_report(
     result: ReconciliationResult,
     file_name: str | None = None,
@@ -173,7 +191,7 @@ def generate_reconciliation_report(
     file_name = file_name or build_report_file_name(["reconciliation"])
     workbook = Workbook(write_only=True)
 
-    total_rows = len(result.matched) + len(result.missing) + len(result.orphan)
+    total_rows = len(result.matched) + len(result.missing) + len(result.orphan) + len(result.protected)
     written = 0
     started_at = time.monotonic()
 
@@ -195,13 +213,15 @@ def generate_reconciliation_report(
     for idx, width in enumerate([60, 20, 14, 22, 16, 16, 12], start=1):
         matched_sheet.column_dimensions[get_column_letter(idx)].width = width
     matched_sheet.append(
-        _header_row(matched_sheet, ["Path", "Bucket", "Size (MB)", "Last Modified", "Table", "Column", "Row ID"])
+        _header_row(
+            matched_sheet, ["Value (as stored in DB)", "Bucket", "Size (MB)", "Last Modified", "Table", "Column", "Row ID"]
+        )
     )
     for file in result.matched:
-        url = build_object_url(provider, file.bucket, file.path)
+        fallback_url = build_object_url(provider, file.bucket, file.path)
         matched_sheet.append(
             [
-                _hyperlink_cell(matched_sheet, url),
+                _raw_value_cell(matched_sheet, file.raw_value, fallback_url),
                 file.bucket,
                 _mb(file.size),
                 _naive(file.last_modified),
@@ -215,16 +235,16 @@ def generate_reconciliation_report(
     missing_sheet = workbook.create_sheet("Missing")
     for idx, width in enumerate([60, 16, 16, 12], start=1):
         missing_sheet.column_dimensions[get_column_letter(idx)].width = width
-    missing_sheet.append(_header_row(missing_sheet, ["Path", "Table", "Column", "Row ID"]))
+    missing_sheet.append(_header_row(missing_sheet, ["Value (as stored in DB)", "Table", "Column", "Row ID"]))
     for file in result.missing:
         # A missing file was never found in storage, so this link (when we have enough info to
         # build one at all) points at where it *would* be — it will 404, but that's still more
-        # useful for tracking it down than a bare relative key.
-        if file.bucket:
-            url = build_object_url(provider, file.bucket, file.path)
-            missing_sheet.append([_hyperlink_cell(missing_sheet, url), file.table, file.column, file.id])
-        else:
-            missing_sheet.append([file.path, file.table, file.column, file.id])
+        # useful for tracking it down than a bare relative key. The displayed text is always the
+        # raw DB value regardless — never a URL rebuilt from the parsed bucket/key.
+        fallback_url = build_object_url(provider, file.bucket, file.path) if file.bucket else None
+        missing_sheet.append(
+            [_raw_value_cell(missing_sheet, file.raw_value, fallback_url), file.table, file.column, file.id]
+        )
         tick("Missing")
 
     orphan_sheet = workbook.create_sheet("Orphan")
@@ -238,26 +258,128 @@ def generate_reconciliation_report(
         )
         tick("Orphan")
 
+    # Only present when the run was given content_mappings (rich-text/JSON columns) to cross-check
+    # against — otherwise Orphan already is the full "not found anywhere" set and this stays empty.
+    # A file lands here instead of Orphan because its key was found embedded inside one of those
+    # columns (e.g. a CKEditor/CKFinder upload referenced only as an <img> inside a lesson's HTML
+    # body) — kept visible rather than silently dropped, so a reviewer can see why it was spared.
+    protected_sheet = workbook.create_sheet("Protected (rich-text, JSON)")
+    for idx, width in enumerate([60, 20, 14, 22], start=1):
+        protected_sheet.column_dimensions[get_column_letter(idx)].width = width
+    protected_sheet.append(_header_row(protected_sheet, ["Path", "Bucket", "Size (MB)", "Last Modified"]))
+    for file in result.protected:
+        url = build_object_url(provider, file.bucket, file.path)
+        protected_sheet.append(
+            [_hyperlink_cell(protected_sheet, url), file.bucket, _mb(file.size), _naive(file.last_modified)]
+        )
+        tick("Protected")
+
     if on_progress:
         on_progress("report", total_rows, total_rows, "Saving workbook to disk…", None)
 
-    # Missing files were never found in storage, so they have no size to report; matched +
-    # orphan together account for every object actually seen in storage, so their sizes sum to
-    # the same total as "Object Storage Objects".
+    # Missing files were never found in storage, so they have no size to report; matched + orphan
+    # + protected together account for every object actually seen in storage, so their sizes sum
+    # to the same total as "Object Storage Objects".
     matched_size = sum(f.size for f in result.matched)
     orphan_size = sum(f.size for f in result.orphan)
+    protected_size = sum(f.size for f in result.protected)
 
     summary_sheet = workbook.create_sheet("Summary")
-    for idx, width in enumerate([30, 16, 16], start=1):
+    for idx, width in enumerate([34, 16, 16], start=1):
         summary_sheet.column_dimensions[get_column_letter(idx)].width = width
     summary_sheet.append(_header_row(summary_sheet, ["Metric", "Count", "Size (GB)"]))
     summary_sheet.append(["Matched", result.summary.matched_count, _gb(matched_size)])
     summary_sheet.append(["Missing", result.summary.missing_count, ""])
-    summary_sheet.append(["Orphan", result.summary.orphan_count, _gb(orphan_size)])
+    summary_sheet.append(["Orphan (confirmed unused)", result.summary.orphan_count, _gb(orphan_size)])
+    summary_sheet.append(["Protected (in rich-text/JSON content)", result.summary.protected_count, _gb(protected_size)])
     summary_sheet.append(["Database File References", result.summary.database_file_count, ""])
+    summary_sheet.append(["Rich-text/JSON Rows Scanned", result.summary.content_reference_count, ""])
     summary_sheet.append(
-        ["Object Storage Objects", result.summary.storage_object_count, _gb(matched_size + orphan_size)]
+        [
+            "Object Storage Objects",
+            result.summary.storage_object_count,
+            _gb(matched_size + orphan_size + protected_size),
+        ]
     )
     summary_sheet.append(["Skipped (other provider)", result.summary.other_provider_count, ""])
+    summary_sheet.append(["Skipped (different provider host)", result.summary.different_provider_count, ""])
+
+    return _save_workbook(workbook, file_name)
+
+
+def generate_do_cleanup_report(
+    result: DoCleanupResult,
+    file_name: str | None = None,
+    provider: str | None = None,
+    on_progress: ReportProgressCallback | None = None,
+) -> str:
+    """
+    Same write_only shape as generate_reconciliation_report. "Cleanup Candidates" is the actual
+    deliverable (orphaned, and not found embedded in any rich-text/CKEditor column either);
+    "Protected" is kept alongside for transparency — it's the reason a file that showed up as
+    Orphan in a plain reconciliation report is *not* here, so a reviewer isn't left guessing.
+    """
+    file_name = file_name or build_report_file_name(["do-cleanup"])
+    workbook = Workbook(write_only=True)
+
+    total_rows = len(result.candidates) + len(result.protected)
+    written = 0
+    started_at = time.monotonic()
+
+    def tick(sheet_label: str) -> None:
+        nonlocal written
+        written += 1
+        if on_progress and written % _REPORT_TICK_EVERY_ROWS == 0:
+            elapsed = max(time.monotonic() - started_at, 0.001)
+            on_progress(
+                "report",
+                written,
+                total_rows,
+                f"Writing {sheet_label} sheet — {written:,}/{total_rows:,} row(s) ({written / elapsed:,.0f}/s)",
+                None,
+            )
+
+    candidates_sheet = workbook.create_sheet("Cleanup Candidates")
+    for idx, width in enumerate([60, 20, 14, 22], start=1):
+        candidates_sheet.column_dimensions[get_column_letter(idx)].width = width
+    candidates_sheet.append(_header_row(candidates_sheet, ["Path", "Bucket", "Size (MB)", "Last Modified"]))
+    for file in result.candidates:
+        url = build_object_url(provider, file.bucket, file.path)
+        candidates_sheet.append(
+            [_hyperlink_cell(candidates_sheet, url), file.bucket, _mb(file.size), _naive(file.last_modified)]
+        )
+        tick("Cleanup Candidates")
+
+    protected_sheet = workbook.create_sheet("Protected (in rich-text content)")
+    for idx, width in enumerate([60, 20, 14, 22], start=1):
+        protected_sheet.column_dimensions[get_column_letter(idx)].width = width
+    protected_sheet.append(_header_row(protected_sheet, ["Path", "Bucket", "Size (MB)", "Last Modified"]))
+    for file in result.protected:
+        url = build_object_url(provider, file.bucket, file.path)
+        protected_sheet.append(
+            [_hyperlink_cell(protected_sheet, url), file.bucket, _mb(file.size), _naive(file.last_modified)]
+        )
+        tick("Protected")
+
+    if on_progress:
+        on_progress("report", total_rows, total_rows, "Saving workbook to disk…", None)
+
+    candidate_size = sum(f.size for f in result.candidates)
+    protected_size = sum(f.size for f in result.protected)
+
+    summary_sheet = workbook.create_sheet("Summary")
+    for idx, width in enumerate([36, 16, 16], start=1):
+        summary_sheet.column_dimensions[get_column_letter(idx)].width = width
+    summary_sheet.append(_header_row(summary_sheet, ["Metric", "Count", "Size (GB)"]))
+    summary_sheet.append(["Cleanup Candidates", result.summary.candidate_count, _gb(candidate_size)])
+    summary_sheet.append(["Protected (in rich-text content)", result.summary.protected_count, _gb(protected_size)])
+    summary_sheet.append(["Total Orphan (candidates + protected)", result.summary.orphan_count, ""])
+    summary_sheet.append(["Matched", result.summary.matched_count, ""])
+    summary_sheet.append(["Missing", result.summary.missing_count, ""])
+    summary_sheet.append(["Database File References", result.summary.database_file_count, ""])
+    summary_sheet.append(["Rich-text Rows Scanned", result.summary.content_reference_count, ""])
+    summary_sheet.append(["Object Storage Objects", result.summary.storage_object_count, ""])
+    summary_sheet.append(["Skipped (other provider)", result.summary.other_provider_count, ""])
+    summary_sheet.append(["Skipped (different provider host)", result.summary.different_provider_count, ""])
 
     return _save_workbook(workbook, file_name)
