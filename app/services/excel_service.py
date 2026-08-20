@@ -58,6 +58,10 @@ def _naive(dt: datetime | None) -> datetime | None:
     return dt.replace(tzinfo=None) if dt is not None else None
 
 
+def _year_month(dt: datetime | None) -> str:
+    return dt.strftime("%Y-%m") if dt is not None else ""
+
+
 def _style_header_row(sheet: Worksheet) -> None:
     for cell in sheet[1]:
         cell.font = _BOLD
@@ -248,13 +252,13 @@ def generate_reconciliation_report(
         tick("Missing")
 
     orphan_sheet = workbook.create_sheet("Orphan")
-    for idx, width in enumerate([60, 20, 14, 22], start=1):
+    for idx, width in enumerate([60, 14, 14], start=1):
         orphan_sheet.column_dimensions[get_column_letter(idx)].width = width
-    orphan_sheet.append(_header_row(orphan_sheet, ["Path", "Bucket", "Size (MB)", "Last Modified"]))
+    orphan_sheet.append(_header_row(orphan_sheet, ["Path", "Size (MB)", "Last Modified"]))
     for file in result.orphan:
         url = build_object_url(provider, file.bucket, file.path)
         orphan_sheet.append(
-            [_hyperlink_cell(orphan_sheet, url), file.bucket, _mb(file.size), _naive(file.last_modified)]
+            [_hyperlink_cell(orphan_sheet, url), _mb(file.size), _year_month(file.last_modified)]
         )
         tick("Orphan")
 
