@@ -6,7 +6,7 @@ import uuid
 from collections.abc import Callable
 from datetime import date, datetime
 
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.cell import WriteOnlyCell
 from openpyxl.styles import Font
 from openpyxl.utils import get_column_letter
@@ -14,6 +14,7 @@ from openpyxl.worksheet.worksheet import Worksheet
 
 from app.config import env
 from app.providers.s3_provider import build_object_url
+from app.services.reconciliation_service import _split_object_reference
 from app.types import DoCleanupResult, ReconciliationResult, StorageSummary
 
 _BOLD = Font(bold=True)
@@ -254,11 +255,22 @@ def generate_reconciliation_report(
     orphan_sheet = workbook.create_sheet("Orphan")
     for idx, width in enumerate([60, 14, 14], start=1):
         orphan_sheet.column_dimensions[get_column_letter(idx)].width = width
-    orphan_sheet.append(_header_row(orphan_sheet, ["Path", "Size (MB)", "Last Modified"]))
+    # Bucket/Key are written but hidden — keeps the visible sheet exactly the 3 columns asked
+    # for, while still letting the delete feature (parse_deletable_report) recover the exact
+    # (bucket, key) pair for each row without depending on the clickable link's URL format.
+    orphan_sheet.column_dimensions[get_column_letter(4)].hidden = True
+    orphan_sheet.column_dimensions[get_column_letter(5)].hidden = True
+    orphan_sheet.append(_header_row(orphan_sheet, ["Path", "Size (MB)", "Last Modified", "Bucket", "Key"]))
     for file in result.orphan:
         url = build_object_url(provider, file.bucket, file.path)
         orphan_sheet.append(
-            [_hyperlink_cell(orphan_sheet, url), _mb(file.size), _year_month(file.last_modified)]
+            [
+                _hyperlink_cell(orphan_sheet, url),
+                _mb(file.size),
+                _year_month(file.last_modified),
+                file.bucket,
+                file.path,
+            ]
         )
         tick("Orphan")
 
@@ -346,11 +358,15 @@ def generate_do_cleanup_report(
     candidates_sheet = workbook.create_sheet("Cleanup Candidates")
     for idx, width in enumerate([60, 20, 14, 22], start=1):
         candidates_sheet.column_dimensions[get_column_letter(idx)].width = width
-    candidates_sheet.append(_header_row(candidates_sheet, ["Path", "Bucket", "Size (MB)", "Last Modified"]))
+    # Key is written but hidden — Bucket is already a visible column here, but the delete
+    # feature (parse_deletable_report) still needs the exact, unmodified key rather than the
+    # clickable link's display URL.
+    candidates_sheet.column_dimensions[get_column_letter(5)].hidden = True
+    candidates_sheet.append(_header_row(candidates_sheet, ["Path", "Bucket", "Size (MB)", "Last Modified", "Key"]))
     for file in result.candidates:
         url = build_object_url(provider, file.bucket, file.path)
         candidates_sheet.append(
-            [_hyperlink_cell(candidates_sheet, url), file.bucket, _mb(file.size), _naive(file.last_modified)]
+            [_hyperlink_cell(candidates_sheet, url), file.bucket, _mb(file.size), _naive(file.last_modified), file.path]
         )
         tick("Cleanup Candidates")
 
@@ -387,3 +403,67 @@ def generate_do_cleanup_report(
     summary_sheet.append(["Skipped (different provider host)", result.summary.different_provider_count, ""])
 
     return _save_workbook(workbook, file_name)
+
+
+_DELETABLE_SHEET_NAMES = ("Orphan", "Cleanup Candidates")
+
+
+def parse_deletable_report(file_obj) -> list[dict]:
+    """
+    Reads a previously-downloaded Orphan/Cleanup Candidates report back in, for the delete
+    feature: a human has already reviewed this exact file (possibly hand-edited — trimmed down
+    to a shortlist, reordered, whatever) and is now selecting which rows to remove.
+
+    Prefers the hidden Bucket/Key columns those sheets carry (see generate_reconciliation_report
+    / generate_do_cleanup_report) since they're exact and don't care about column order. But a
+    hand-edited copy easily loses hidden columns entirely (Excel rewrites the whole file on
+    save), so when they're missing this falls back to re-deriving (bucket, key) from the visible
+    Path column's URL — the same parsing reconciliation already relies on elsewhere, so it works
+    for any row whose Path still looks like a URL this app generated. Raises ValueError on
+    anything that doesn't look like one of those two reports, rather than silently returning
+    nothing.
+    """
+    try:
+        workbook = load_workbook(file_obj, read_only=True, data_only=True)
+    except Exception as error:  # noqa: BLE001 - openpyxl raises its own zip/XML errors for anything not a real .xlsx
+        raise ValueError(f"Not a valid .xlsx file: {error}") from error
+
+    sheet_name = next((s for s in _DELETABLE_SHEET_NAMES if s in workbook.sheetnames), None)
+    if sheet_name is None:
+        raise ValueError(
+            f"No {' or '.join(_DELETABLE_SHEET_NAMES)} sheet found in the uploaded file — "
+            "upload a report downloaded from Auto reconciliation or DO cleanup candidates."
+        )
+    ws = workbook[sheet_name]
+
+    rows_iter = ws.iter_rows(values_only=True)
+    header = next(rows_iter, None)
+    if not header:
+        return []
+    col_index = {str(name).strip().lower(): i for i, name in enumerate(header) if name is not None}
+    if "path" not in col_index or "size (mb)" not in col_index:
+        raise ValueError(f"'{sheet_name}' sheet is missing expected column(s): path, size (mb)")
+    has_bucket_key_columns = "bucket" in col_index and "key" in col_index
+
+    results = []
+    for row in rows_iter:
+        path = row[col_index["path"]]
+        if has_bucket_key_columns:
+            bucket, key = row[col_index["bucket"]], row[col_index["key"]]
+        elif path:
+            bucket, key, _provider = _split_object_reference(str(path))
+        else:
+            bucket, key = None, None
+        if not bucket or not key:
+            continue
+        last_modified = row[col_index["last modified"]] if "last modified" in col_index else None
+        results.append(
+            {
+                "path": path,
+                "bucket": bucket,
+                "key": key,
+                "sizeMb": row[col_index["size (mb)"]],
+                "lastModified": str(last_modified) if last_modified is not None else None,
+            }
+        )
+    return results

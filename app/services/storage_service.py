@@ -132,3 +132,77 @@ def get_storage_summary(
         object_count=sum(b.object_count for b in reportable),
         total_size=sum(b.total_size for b in reportable),
     )
+
+
+_DELETE_BATCH_SIZE = 1000  # S3 DeleteObjects hard limit per request
+# Deliberately smaller than the S3 max when progress is being streamed: a human reviewing a
+# checkbox list before confirming rarely selects anywhere near 1000 files, and batching at 1000
+# would mean the progress bar jumps straight from 0% to 100% with nothing in between for exactly
+# the runs where watching it matters most. 50 keeps every batch's blast radius small too.
+_DELETE_STREAM_BATCH_SIZE = 50
+
+
+def delete_objects(
+    items: list[tuple[str, str]],
+    provider: str | None = None,
+    batch_size: int = _DELETE_BATCH_SIZE,
+    on_progress: Callable[[int, int, str], None] | None = None,
+) -> list[dict]:
+    """
+    Permanently deletes objects — irreversible, no confirmation or safety check happens here;
+    the caller (the /storage/delete route) is where that belongs. Grouped by bucket since
+    DeleteObjects is a per-bucket batch call; returns one result per requested (bucket, key),
+    success or error, in the same order they were given — the caller's audit trail of exactly
+    what happened to each item. on_progress(completed, total, bucket), when given, fires after
+    every batch actually returns from the provider — never optimistically before.
+    """
+    client = get_s3_client(provider)
+
+    by_bucket: dict[str, list[str]] = {}
+    for bucket, key in items:
+        by_bucket.setdefault(bucket, []).append(key)
+
+    total = len(items)
+    completed = 0
+    outcome_by_item: dict[tuple[str, str], dict] = {}
+    for bucket, keys in by_bucket.items():
+        for start in range(0, len(keys), batch_size):
+            chunk = keys[start : start + batch_size]
+            try:
+                resp = client.delete_objects(
+                    Bucket=bucket,
+                    Delete={"Objects": [{"Key": k} for k in chunk], "Quiet": False},
+                )
+            except Exception as error:  # noqa: BLE001 - one bad batch shouldn't lose the whole request's audit trail
+                message = str(error)
+                for key in chunk:
+                    outcome_by_item[(bucket, key)] = {
+                        "bucket": bucket, "key": key, "success": False, "error": message
+                    }
+                completed += len(chunk)
+                if on_progress:
+                    on_progress(completed, total, bucket)
+                continue
+
+            for deleted in resp.get("Deleted", []):
+                outcome_by_item[(bucket, deleted["Key"])] = {
+                    "bucket": bucket, "key": deleted["Key"], "success": True, "error": None
+                }
+            for err in resp.get("Errors", []):
+                outcome_by_item[(bucket, err["Key"])] = {
+                    "bucket": bucket,
+                    "key": err["Key"],
+                    "success": False,
+                    "error": err.get("Message") or err.get("Code") or "Unknown error",
+                }
+            completed += len(chunk)
+            if on_progress:
+                on_progress(completed, total, bucket)
+
+    return [
+        outcome_by_item.get(
+            (bucket, key),
+            {"bucket": bucket, "key": key, "success": False, "error": "No response from provider"},
+        )
+        for bucket, key in items
+    ]

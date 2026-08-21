@@ -310,6 +310,50 @@
     <div id="reconStats" class="stat-row"></div>
     <div id="reconReport"></div>
   </section>
+
+  <section class="card" style="border-color:var(--err);">
+    <h2 style="color:var(--err);">Delete files from report</h2>
+    <p class="hint">
+      Upload an Orphan or Cleanup Candidates report you already downloaded and reviewed. Nothing
+      is deleted until you tick the rows you want gone and type the confirmation phrase — this
+      is permanent and cannot be undone by this tool.
+    </p>
+    <div class="row">
+      <div>
+        <label>Report file (.xlsx)</label><br />
+        <input type="file" id="deleteFileInput" accept=".xlsx" />
+      </div>
+    </div>
+    <div id="deleteMsg" class="msg"></div>
+    <div id="deleteTableWrap" style="display:none; overflow-x:auto;">
+      <table id="deleteTable">
+        <thead>
+          <tr>
+            <th><input type="checkbox" id="deleteSelectAll" /></th>
+            <th>Path</th>
+            <th>Size (MB)</th>
+            <th>Last Modified</th>
+          </tr>
+        </thead>
+        <tbody id="deleteTableBody"></tbody>
+      </table>
+    </div>
+    <div id="deleteSummary" class="msg" style="margin-top:12px;"></div>
+    <div class="row" style="margin-top:12px; display:none;" id="deleteActionRow">
+      <div>
+        <label>Type "HAPUS" to enable delete</label><br />
+        <input type="text" id="deleteConfirmInput" placeholder="HAPUS" size="16" />
+      </div>
+      <button class="danger" id="deleteRunBtn" style="align-self:flex-end; padding:8px 14px;" disabled>
+        Delete selected permanently
+      </button>
+    </div>
+    <div id="deleteProgressWrap" style="display:none; margin-top:12px;">
+      <div class="progress-track"><div id="deleteProgressBar" class="progress-fill" style="background:var(--err);"></div></div>
+      <div id="deleteProgressLabel" class="loading"></div>
+    </div>
+    <div id="deleteResult" class="msg" style="margin-top:12px;"></div>
+  </section>
 </main>
 
 <script>
@@ -724,6 +768,151 @@
       runReconBtn.disabled = false;
       reconLoading.style.display = "none";
       reconLoading.textContent = defaultLoadingText;
+    }
+  });
+
+  // --- Delete files from report ---
+  const DELETE_CONFIRM_PHRASE = "HAPUS";
+  const deleteFileInput = document.getElementById("deleteFileInput");
+  const deleteMsg = document.getElementById("deleteMsg");
+  const deleteTableWrap = document.getElementById("deleteTableWrap");
+  const deleteTableBody = document.getElementById("deleteTableBody");
+  const deleteSelectAll = document.getElementById("deleteSelectAll");
+  const deleteSummary = document.getElementById("deleteSummary");
+  const deleteActionRow = document.getElementById("deleteActionRow");
+  const deleteConfirmInput = document.getElementById("deleteConfirmInput");
+  const deleteRunBtn = document.getElementById("deleteRunBtn");
+  const deleteResult = document.getElementById("deleteResult");
+
+  let deleteRows = []; // parsed from the uploaded report: {path, bucket, key, sizeMb, lastModified}
+
+  function checkedDeleteBoxes() {
+    return Array.from(deleteTableBody.querySelectorAll("input[type=checkbox]"));
+  }
+
+  function updateDeleteState() {
+    const boxes = checkedDeleteBoxes();
+    const checked = boxes.filter((cb) => cb.checked);
+    const totalMb = checked.reduce((sum, cb) => sum + (parseFloat(cb.dataset.sizeMb) || 0), 0);
+    deleteSummary.textContent = checked.length
+      ? `${checked.length} file(s) selected — ${totalMb.toLocaleString(undefined, { maximumFractionDigits: 2 })} MB total`
+      : "";
+    deleteSelectAll.checked = boxes.length > 0 && checked.length === boxes.length;
+    const confirmed = deleteConfirmInput.value.trim() === DELETE_CONFIRM_PHRASE;
+    deleteRunBtn.disabled = !(checked.length > 0 && confirmed);
+  }
+
+  deleteConfirmInput.addEventListener("input", updateDeleteState);
+
+  deleteFileInput.addEventListener("change", async () => {
+    const file = deleteFileInput.files[0];
+    if (!file) return;
+
+    deleteMsg.textContent = "Parsing report…";
+    deleteMsg.className = "msg";
+    deleteTableWrap.style.display = "none";
+    deleteTableBody.innerHTML = "";
+    deleteActionRow.style.display = "none";
+    deleteResult.textContent = "";
+    deleteConfirmInput.value = "";
+    deleteRows = [];
+
+    try {
+      const formData = new FormData();
+      formData.append("file", file);
+      const body = await fetchJson("/storage/parse-report", { method: "POST", body: formData });
+      deleteRows = body.data.rows;
+
+      if (deleteRows.length === 0) {
+        deleteMsg.textContent = "No rows found in this report — nothing to delete.";
+        return;
+      }
+
+      deleteRows.forEach((row, i) => {
+        const tr = document.createElement("tr");
+        tr.innerHTML = `
+          <td><input type="checkbox" data-index="${i}" data-size-mb="${row.sizeMb || 0}" /></td>
+          <td style="word-break:break-all;">${row.path ?? ""}</td>
+          <td>${row.sizeMb ?? ""}</td>
+          <td>${row.lastModified ?? ""}</td>
+        `;
+        tr.querySelector("input[type=checkbox]").addEventListener("change", updateDeleteState);
+        deleteTableBody.appendChild(tr);
+      });
+
+      deleteTableWrap.style.display = "block";
+      deleteActionRow.style.display = "flex";
+      deleteMsg.textContent = `Loaded ${deleteRows.length} row(s) from "${file.name}". Nothing is selected yet.`;
+      deleteMsg.className = "msg ok";
+      updateDeleteState();
+    } catch (err) {
+      deleteMsg.textContent = err.message;
+      deleteMsg.className = "msg err";
+    }
+  });
+
+  deleteSelectAll.addEventListener("change", () => {
+    checkedDeleteBoxes().forEach((cb) => { cb.checked = deleteSelectAll.checked; });
+    updateDeleteState();
+  });
+
+  const deleteProgressWrap = document.getElementById("deleteProgressWrap");
+  const deleteProgressBar = document.getElementById("deleteProgressBar");
+  const deleteProgressLabel = document.getElementById("deleteProgressLabel");
+
+  deleteRunBtn.addEventListener("click", async () => {
+    const checked = checkedDeleteBoxes().filter((cb) => cb.checked);
+    const items = checked.map((cb) => {
+      const row = deleteRows[Number(cb.dataset.index)];
+      return { bucket: row.bucket, key: row.key, path: row.path, sizeMb: row.sizeMb };
+    });
+
+    if (!confirm(`Permanently delete ${items.length} file(s)? This cannot be undone.`)) return;
+
+    deleteRunBtn.disabled = true;
+    deleteResult.textContent = "";
+    deleteProgressWrap.style.display = "block";
+    deleteProgressBar.style.width = "0%";
+    deleteProgressLabel.textContent = `0 / ${items.length} deleted (0%)`;
+
+    try {
+      const payload = { items, confirm: deleteConfirmInput.value.trim() };
+      if (selectedProvider()) payload.provider = selectedProvider();
+
+      await fetchSse(
+        "/storage/delete/stream",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        },
+        {
+          progress: (d) => {
+            deleteProgressBar.style.width = `${d.percent}%`;
+            deleteProgressLabel.textContent = `${d.completed} / ${d.total} deleted (${d.percent}%) — ${d.bucket}`;
+          },
+          done: (d) => {
+            const { succeededCount, failedCount, auditFile, results } = d;
+            deleteResult.textContent =
+              `Deleted ${succeededCount} file(s)${failedCount ? `, ${failedCount} failed` : ""}. Audit log: ${auditFile}`;
+            deleteResult.className = failedCount ? "msg err" : "msg ok";
+
+            // Drop successfully-deleted rows from the table/model so it reflects what's actually left.
+            results.forEach((r, i) => {
+              if (r.success) checked[i].closest("tr").remove();
+            });
+            deleteRows = deleteRows.filter(
+              (row) => !results.some((r) => r.success && r.bucket === row.bucket && r.key === row.key)
+            );
+          },
+        },
+      );
+    } catch (err) {
+      deleteResult.textContent = err.message;
+      deleteResult.className = "msg err";
+    } finally {
+      deleteProgressWrap.style.display = "none";
+      updateDeleteState();
     }
   });
 </script>
