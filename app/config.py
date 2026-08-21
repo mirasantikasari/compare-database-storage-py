@@ -63,6 +63,8 @@ class Env:
     db: DbConfig
     reports_dir: str
     storage_summary_concurrency: int
+    db_scan_concurrency: int
+    max_content_scan_table_rows: int
 
 
 def _load_env() -> Env:
@@ -92,6 +94,18 @@ def _load_env() -> Env:
         ),
         reports_dir=os.environ.get("REPORTS_DIR", "reports"),
         storage_summary_concurrency=int(os.environ.get("STORAGE_SUMMARY_CONCURRENCY", "8")),
+        # Deliberately separate from storage_summary_concurrency (which only ever calls out to
+        # S3-compatible APIs — safe to parallelize aggressively). This one bounds how many
+        # simultaneous full-column table scans hit the *production* MySQL server at once, so it
+        # defaults low: a handful of parallel LONGTEXT/JSON column scans against a live production
+        # database is enough to exhaust its connection pool or saturate its CPU/IOPS.
+        db_scan_concurrency=int(os.environ.get("DB_SCAN_CONCURRENCY", "2")),
+        # Tables at or above this (approximate, from information_schema — no COUNT(*) needed)
+        # row count are skipped by the rich-text/JSON content scan entirely. This is squarely
+        # aimed at append-only audit/activity-log tables: by far the largest tables in a typical
+        # schema, and the least valuable to scan for embedded file references (they're historical
+        # snapshots, not the live content columns that actually need protecting).
+        max_content_scan_table_rows=int(os.environ.get("MAX_CONTENT_SCAN_TABLE_ROWS", "50000")),
     )
 
 

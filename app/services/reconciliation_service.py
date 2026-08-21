@@ -21,7 +21,7 @@ from app.services.checkpoint_service import (
     storage_object_from_dict,
     storage_object_to_dict,
 )
-from app.services.mysql_service import fetch_file_references
+from app.services.mysql_service import CONTENT_BATCH_SIZE, fetch_file_references
 from app.services.storage_service import is_region_mismatch_error, iterate_bucket_objects, list_buckets
 from app.types import (
     CleanupCandidate,
@@ -258,7 +258,7 @@ def _fetch_mappings(
             on_progress("database", done, len(mappings), mapping_key, error)
 
     if mappings:
-        workers = min(env.storage_summary_concurrency, len(mappings))
+        workers = min(env.db_scan_concurrency, len(mappings))
         with ThreadPoolExecutor(max_workers=workers) as pool:
             list(pool.map(work, range(len(mappings))))
 
@@ -510,7 +510,7 @@ def _collect_content_keys(
     """
     keys: set[str] = set()
     rows_scanned = 0
-    for ref in fetch_file_references(mapping, database):
+    for ref in fetch_file_references(mapping, database, batch_size=CONTENT_BATCH_SIZE):
         rows_scanned += 1
         keys |= _extract_embedded_keys(ref.value, buckets)
         if on_tick and rows_scanned % _TICK_EVERY_MAPPING_ROWS == 0:
@@ -575,7 +575,7 @@ def _fetch_content_keys(
             on_progress("content", done, len(mappings), mapping_key, error)
 
     if mappings:
-        workers = min(env.storage_summary_concurrency, len(mappings))
+        workers = min(env.db_scan_concurrency, len(mappings))
         with ThreadPoolExecutor(max_workers=workers) as pool:
             list(pool.map(work, range(len(mappings))))
 

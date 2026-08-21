@@ -10,6 +10,11 @@ from app.types import DbFileReference, TableColumnMapping
 
 IDENTIFIER_PATTERN = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_-]*$")
 BATCH_SIZE = 5000
+# Rich-text/JSON columns can carry a payload many times heavier per row than a short VARCHAR path
+# (a LONGTEXT lesson body can run into the hundreds of KB) — 5000 of those in a single SELECT can
+# mean tens/hundreds of MB moved in one query. A smaller batch keeps each round-trip bounded and
+# gives a busy production MySQL server more, smaller breathing points instead of one huge pull.
+CONTENT_BATCH_SIZE = 500
 
 _pool = PooledDB(
     creator=pymysql,
@@ -40,6 +45,7 @@ def _escape_id(name: str) -> str:
 def fetch_file_references(
     mapping: TableColumnMapping,
     database: str | None = None,
+    batch_size: int = BATCH_SIZE,
 ) -> Iterator[DbFileReference]:
     """
     Reads non-empty values from a table/column in id-ordered batches (keyset pagination)
@@ -72,7 +78,7 @@ def fetch_file_references(
                     WHERE {column} IS NOT NULL AND {column} <> ''
                         {cursor_clause}
                     ORDER BY {id_col} ASC
-                    LIMIT {BATCH_SIZE}
+                    LIMIT {batch_size}
                 """
                 params = [last_id] if last_id is not None else []
                 cursor.execute(sql, params)
@@ -84,7 +90,7 @@ def fetch_file_references(
                     )
                     last_id = row["id"]
 
-                has_more = len(rows) == BATCH_SIZE
+                has_more = len(rows) == batch_size
     finally:
         conn.close()
 
@@ -126,8 +132,24 @@ EXCLUDE_COLUMN_OVERRIDE = {"id_file"}
 # same "not a single dedicated path column" way rich text does, just structured instead of HTML.
 CONTENT_DATA_TYPES = {"text", "tinytext", "mediumtext", "longtext", "json"}
 
+# Pure audit/activity-log tables: append-only history, never the live source a lesson's content
+# actually lives in — scanning them for embedded file references adds real DB load (they're
+# consistently among the largest tables in the schema) for close to zero protective value, since
+# anything still genuinely in use also shows up in the *current* content column that logs it.
+# Deliberately an exact-name allowlist rather than a "contains 'log'" pattern: names alone don't
+# reliably say which — `course_assignment_log` holds real submission content (description/
+# file_upload) despite the name, while `course_quiz_log` is genuinely just a per-attempt event
+# log (its `question` is a redundant snapshot of course_quiz_detail.question, already scanned
+# there) — confirmed against this schema, not guessed from naming convention alone.
+EXCLUDE_CONTENT_TABLE_PATTERN = re.compile(
+    r"^(activity_log|authentication_log|log_activity|log_score|log_score_final|"
+    r"course_quiz_log|users_notification_log|mod_penilaian_log_nilai|"
+    r"mod_penilaian_log_aktifitas)$",
+    re.I,
+)
 
-def _introspect_columns(database: str) -> tuple[list[dict], dict[str, str]]:
+
+def _introspect_columns(database: str) -> tuple[list[dict], dict[str, str], dict[str, int]]:
     conn = _pool.connection()
     try:
         with conn.cursor() as cursor:
@@ -152,6 +174,20 @@ def _introspect_columns(database: str) -> tuple[list[dict], dict[str, str]]:
                 [database],
             )
             primary_keys = cursor.fetchall()
+
+            # TABLE_ROWS is an estimate from index statistics, not a real COUNT(*) — cheap
+            # metadata-only lookup (InnoDB doesn't need to touch a single data page for it),
+            # which is the whole point: telling a 500k-row audit-log table apart from a normal
+            # one shouldn't itself require scanning that table.
+            cursor.execute(
+                """
+                SELECT TABLE_NAME AS tableName, TABLE_ROWS AS tableRows
+                FROM information_schema.TABLES
+                WHERE TABLE_SCHEMA = %s
+                """,
+                [database],
+            )
+            table_row_stats = cursor.fetchall()
     finally:
         conn.close()
 
@@ -159,7 +195,11 @@ def _introspect_columns(database: str) -> tuple[list[dict], dict[str, str]]:
     for row in primary_keys:
         primary_key_by_table.setdefault(row["tableName"], row["columnName"])
 
-    return columns, primary_key_by_table
+    row_count_by_table: dict[str, int] = {
+        row["tableName"]: row["tableRows"] or 0 for row in table_row_stats
+    }
+
+    return columns, primary_key_by_table, row_count_by_table
 
 
 def discover_file_columns(database: str) -> list[TableColumnMapping]:
@@ -171,7 +211,7 @@ def discover_file_columns(database: str) -> list[TableColumnMapping]:
     having to hand-configure every table/column on every database.
     """
     _assert_valid_identifier(database, "database")
-    columns, primary_key_by_table = _introspect_columns(database)
+    columns, primary_key_by_table, _row_count_by_table = _introspect_columns(database)
 
     mappings: list[TableColumnMapping] = []
     for col in columns:
@@ -212,9 +252,17 @@ def discover_content_columns(database: str) -> list[TableColumnMapping]:
     would make a still-referenced file look like a safe-to-delete orphan, which is exactly the
     mistake this scan exists to prevent — so it deliberately errs toward scanning more text
     columns than strictly necessary rather than risk missing one.
+
+    Two exceptions, both aimed at the same problem (this hammering a *production* database):
+    - Tables at or above env.max_content_scan_table_rows (by estimated row count, not a real
+      scan) are skipped outright.
+    - Known pure audit/activity-log tables (EXCLUDE_CONTENT_TABLE_PATTERN) are skipped by name
+      regardless of size — they're historical snapshots, not where a lesson's live, still-editable
+      content actually lives, so scanning them buys close to nothing over scanning the *current*
+      content column that they're a log of.
     """
     _assert_valid_identifier(database, "database")
-    columns, primary_key_by_table = _introspect_columns(database)
+    columns, primary_key_by_table, row_count_by_table = _introspect_columns(database)
 
     return [
         TableColumnMapping(
@@ -223,5 +271,8 @@ def discover_content_columns(database: str) -> list[TableColumnMapping]:
             id_column=primary_key_by_table.get(col["tableName"], "id"),
         )
         for col in columns
-        if col["dataType"].lower() in CONTENT_DATA_TYPES and not EXCLUDE_TABLE_PATTERN.search(col["tableName"])
+        if col["dataType"].lower() in CONTENT_DATA_TYPES
+        and not EXCLUDE_TABLE_PATTERN.search(col["tableName"])
+        and not EXCLUDE_CONTENT_TABLE_PATTERN.match(col["tableName"])
+        and row_count_by_table.get(col["tableName"], 0) < env.max_content_scan_table_rows
     ]
