@@ -145,6 +145,70 @@ def generate_storage_report(summary: StorageSummary, file_name: str | None = Non
     return _save_workbook(workbook, file_name)
 
 
+def generate_copy_report(entries: list[dict], dest_provider: str | None, file_name: str | None = None) -> str:
+    """
+    One row per item a /storage/copy(/stream) run was asked to handle, deliverable for "what
+    actually got moved to the new provider and where does it live now" — each entry is:
+    {sourcePath, bucket, key, destBucket, sizeMb, status, error} where status is "Copied"
+    (freshly transferred), "Skipped" (already existed at the destination — see copy_objects'
+    overwrite=False default), or "Failed". The Destination URL column is built the same way
+    every other report's clickable link is (build_object_url) and is shown even for a Failed row
+    (where it points at where the object would be) so a reviewer can immediately tell the two
+    providers' copies apart without reconstructing the URL by hand.
+    """
+    file_name = file_name or build_report_file_name(["copy"])
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Copied"
+
+    headers = ["Source Path", "Bucket", "Key", "Destination URL", "Size (MB)", "Status", "Error"]
+    sheet.append(headers)
+    widths = [55, 20, 45, 55, 12, 12, 30]
+    for idx, width in enumerate(widths, start=1):
+        sheet.column_dimensions[sheet.cell(row=1, column=idx).column_letter].width = width
+
+    status_counts: dict[str, int] = {}
+    for entry in entries:
+        status = entry["status"]
+        status_counts[status] = status_counts.get(status, 0) + 1
+
+        dest_url = build_object_url(dest_provider, entry["destBucket"], entry["key"]) if entry.get("destBucket") else None
+        row_idx = sheet.max_row + 1
+        sheet.append(
+            [
+                entry.get("sourcePath") or "",
+                entry["bucket"],
+                entry["key"],
+                dest_url or "",
+                entry.get("sizeMb"),
+                status,
+                entry.get("error") or "",
+            ]
+        )
+        if entry.get("sourcePath"):
+            cell = sheet.cell(row=row_idx, column=1)
+            cell.hyperlink = entry["sourcePath"]
+            cell.font = _HYPERLINK_FONT
+        if dest_url:
+            cell = sheet.cell(row=row_idx, column=4)
+            cell.hyperlink = dest_url
+            cell.font = _HYPERLINK_FONT
+        if status == "Failed":
+            sheet.cell(row=row_idx, column=6).font = _RED
+
+    _style_header_row(sheet)
+
+    summary_sheet = workbook.create_sheet("Summary")
+    summary_sheet.append(["Status", "Count"])
+    for status, count in status_counts.items():
+        summary_sheet.append([status, count])
+    _style_header_row(summary_sheet)
+    for idx, width in enumerate([16, 10], start=1):
+        summary_sheet.column_dimensions[get_column_letter(idx)].width = width
+
+    return _save_workbook(workbook, file_name)
+
+
 def _header_row(ws, headers: list[str]) -> list[WriteOnlyCell]:
     cells = []
     for h in headers:
@@ -464,6 +528,73 @@ def parse_deletable_report(file_obj) -> list[dict]:
                 "key": key,
                 "sizeMb": row[col_index["size (mb)"]],
                 "lastModified": str(last_modified) if last_modified is not None else None,
+            }
+        )
+    return results
+
+
+_MATCHED_SHEET_NAME = "Matched"
+# The exported header has been "Path" since the write side moved to always showing the raw DB
+# value under that name (see generate_reconciliation_report); older downloaded reports may still
+# carry the previous header, so both are accepted here.
+_MATCHED_PATH_HEADERS = ("path", "value (as stored in db)")
+
+
+def parse_matched_report(file_obj) -> list[dict]:
+    """
+    Reads a previously-downloaded reconciliation report's "Matched" sheet back in — the source
+    list for copying files to another provider (e.g. DO -> Wasabi) rather than deleting anything.
+    Matched rows are files already confirmed to exist in both the DB and storage, so unlike
+    parse_deletable_report there's no hidden Bucket/Key pair to prefer: the sheet's own visible
+    Bucket column is trustworthy (it came straight from the storage listing during the scan), and
+    the key is re-derived from the Path column's raw DB value the same way reconciliation itself
+    resolved it (_split_object_reference) — a bare relative key, or a full URL through the
+    provider or a CDN in front of it. Raises ValueError on anything that doesn't look like a
+    reconciliation report.
+    """
+    try:
+        workbook = load_workbook(file_obj, read_only=True, data_only=True)
+    except Exception as error:  # noqa: BLE001 - openpyxl raises its own zip/XML errors for anything not a real .xlsx
+        raise ValueError(f"Not a valid .xlsx file: {error}") from error
+
+    if _MATCHED_SHEET_NAME not in workbook.sheetnames:
+        raise ValueError(
+            f"No '{_MATCHED_SHEET_NAME}' sheet found in the uploaded file — upload a report "
+            "downloaded from Auto reconciliation or Manual reconciliation."
+        )
+    ws = workbook[_MATCHED_SHEET_NAME]
+
+    rows_iter = ws.iter_rows(values_only=True)
+    header = next(rows_iter, None)
+    if not header:
+        return []
+    col_index = {str(name).strip().lower(): i for i, name in enumerate(header) if name is not None}
+
+    path_col = next((h for h in _MATCHED_PATH_HEADERS if h in col_index), None)
+    if path_col is None or "bucket" not in col_index:
+        raise ValueError(f"'{_MATCHED_SHEET_NAME}' sheet is missing expected column(s): path, bucket")
+
+    results = []
+    for row in rows_iter:
+        raw_value = row[col_index[path_col]]
+        bucket = row[col_index["bucket"]]
+        if not raw_value or not bucket:
+            continue
+        _url_bucket, key, _provider_hint = _split_object_reference(str(raw_value))
+        if not key:
+            continue
+        results.append(
+            {
+                "rawValue": raw_value,
+                "bucket": bucket,
+                "key": key,
+                "sizeMb": row[col_index["size (mb)"]] if "size (mb)" in col_index else None,
+                "lastModified": (
+                    str(row[col_index["last modified"]]) if "last modified" in col_index and row[col_index["last modified"]] is not None else None
+                ),
+                "table": row[col_index["table"]] if "table" in col_index else None,
+                "column": row[col_index["column"]] if "column" in col_index else None,
+                "rowId": row[col_index["row id"]] if "row id" in col_index else None,
             }
         )
     return results

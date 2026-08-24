@@ -1,7 +1,10 @@
 import re
 import threading
+import time
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
+
+from botocore.exceptions import ClientError
 
 from app.config import env
 from app.providers.s3_provider import get_s3_client
@@ -206,3 +209,197 @@ def delete_objects(
         )
         for bucket, key in items
     ]
+
+
+_COPY_CONCURRENCY = env.storage_copy_concurrency
+
+
+def _ensure_dest_buckets(dst_client, dest_provider: str, buckets: set[str]) -> dict[str, str | None]:
+    """
+    Creates any of `buckets` that don't already exist on the destination provider, before any
+    item-level copy is attempted. Without this, a first-time migration to a bucket that's never
+    existed on the destination (the common case — a tenant's bucket name being unchanged doesn't
+    mean the bucket itself was ever created there) fails every single item individually with the
+    same NoSuchBucket error, which is both slower (one failed round-trip per item) and a worse
+    error message than catching it once up front. Returns {bucket: error_message_or_None} so the
+    caller can short-circuit every item destined for a bucket that couldn't be created (e.g. the
+    credential lacks CreateBucket permission) instead of letting each one fail the same way again.
+
+    Calls CreateBucket directly rather than checking existence with HeadBucket first — the error
+    a *missing* bucket produces on HeadBucket isn't standardized across S3-compatible providers
+    (AWS: a clean 404/NoSuchBucket; Wasabi: a bare, code-less 400 that's indistinguishable from a
+    real problem), so there's no reliable way to tell "doesn't exist yet" apart from "something's
+    actually wrong" from that response alone. CreateBucket's "you already own this" response is
+    far more consistent — and on Wasabi specifically, re-creating a bucket already owned by the
+    same account is simply a silent no-op, not even an error.
+    """
+    region = None
+    config = env.s3_providers.get(dest_provider)
+    if config:
+        region = config.region
+
+    results: dict[str, str | None] = {}
+    for bucket in buckets:
+        try:
+            if region and region != "us-east-1":
+                dst_client.create_bucket(Bucket=bucket, CreateBucketConfiguration={"LocationConstraint": region})
+            else:
+                dst_client.create_bucket(Bucket=bucket)
+            results[bucket] = None
+        except ClientError as error:
+            code = str(error.response.get("Error", {}).get("Code", ""))
+            # Already exists and this credential owns it -> nothing to do, not a real failure.
+            # (BucketAlreadyExists, by contrast, means someone else owns that name — a genuine
+            # failure, left as an error below.)
+            results[bucket] = None if code == "BucketAlreadyOwnedByYou" else str(error)
+
+    return results
+
+
+_ITEM_PROGRESS_MIN_INTERVAL = 0.2  # seconds between item_progress callbacks for one file
+
+
+def copy_objects(
+    items: list[tuple[str, str]],
+    source_provider: str,
+    dest_provider: str,
+    dest_bucket: str | None = None,
+    overwrite: bool = False,
+    make_public: bool = True,
+    concurrency: int | None = None,
+    on_progress: Callable[[int, int, str, bool, bool], None] | None = None,
+    on_item_progress: Callable[[str, int, int], None] | None = None,
+) -> list[dict]:
+    """
+    Copies objects from one S3-compatible provider to another (e.g. DigitalOcean Spaces ->
+    Wasabi, for a provider migration). Unlike delete_objects, this never touches the source —
+    intentionally: the caller is expected to update the app's own DB references to the new
+    provider first and confirm the migration worked before anything at the old location is
+    considered for removal (see the separate, human-gated delete flow).
+
+    S3's server-side CopyObject only works within a single endpoint, so a cross-provider copy
+    can't use it — instead each object is streamed through the app (GetObject from source,
+    then a managed multipart-aware upload to destination), which is slower but the only option
+    across providers. dest_bucket, when given, sends every item into that one bucket regardless
+    of its source bucket name; otherwise each item keeps its own source bucket name on the
+    destination side too (the common case when a tenant's bucket name is unchanged by the
+    migration). Any destination bucket that doesn't exist yet is created automatically (see
+    _ensure_dest_buckets) — a bucket name being unchanged across providers doesn't mean the
+    bucket itself was ever created on the new one.
+
+    overwrite=False (the default) HeadObjects the destination first and skips the actual
+    GetObject/upload when the key is already there — so re-uploading the same source report (or
+    one that overlaps a previous run) doesn't redo already-finished transfers. This is intentionally
+    keyed off what's actually sitting at the destination rather than which report/file the caller
+    used, since that's the only thing that can't go stale or miss a re-copy from a different
+    report that happens to cover the same objects. Set overwrite=True to force a fresh copy of
+    every item regardless.
+
+    make_public=True (the default) uploads with ACL=public-read. This app's whole premise is
+    files a browser fetches directly by URL (every report's links assume that), and a fresh
+    upload otherwise lands with the destination provider's own default ACL — typically private,
+    even when the *source* object was public (an object's ACL is never preserved by a
+    GetObject+PutObject copy the way it would be by a same-provider CopyObject) — which silently
+    breaks every link pointing at it. Set make_public=False to leave the destination's default
+    ACL alone instead. Note this only sets the object's own ACL: a destination bucket with its
+    own "Block Public Access" style setting enabled (a provider console setting, not something
+    this app can see or change) can still keep objects unreachable regardless of their ACL.
+    on_progress(completed, total, key, success, skipped), when given, fires after each item
+    finishes — never optimistically before. on_item_progress(key, bytes_transferred, total_bytes),
+    when given, fires *during* an in-progress upload (throttled to roughly once every
+    _ITEM_PROGRESS_MIN_INTERVAL seconds per file) — on_progress alone only moves once per whole
+    file, which for a single large file (or a small selection of them) means no feedback at all
+    until it's already done; this is what lets a caller show real "how much longer" progress
+    instead of a bar stuck at 0% the entire time.
+    """
+    src_client = get_s3_client(source_provider)
+    dst_client = get_s3_client(dest_provider)
+
+    target_buckets = {dest_bucket or bucket for bucket, _key in items}
+    bucket_errors = _ensure_dest_buckets(dst_client, dest_provider, target_buckets) if target_buckets else {}
+
+    total = len(items)
+    results: list[dict | None] = [None] * total
+    completed = 0
+    lock = threading.Lock()
+
+    def copy_one(index: int) -> None:
+        nonlocal completed
+        bucket, key = items[index]
+        target_bucket = dest_bucket or bucket
+        skipped = False
+
+        bucket_error = bucket_errors.get(target_bucket)
+        if bucket_error:
+            outcome = {
+                "bucket": bucket, "key": key, "destBucket": target_bucket,
+                "success": False, "skipped": False, "error": f"Destination bucket unavailable: {bucket_error}",
+            }
+            results[index] = outcome
+            with lock:
+                completed += 1
+                done = completed
+            if on_progress:
+                on_progress(done, total, key, False, False)
+            return
+
+        try:
+            if not overwrite:
+                try:
+                    dst_client.head_object(Bucket=target_bucket, Key=key)
+                    skipped = True
+                except ClientError:
+                    skipped = False  # not found at the destination (or a transient error) -> copy for real
+
+            if skipped:
+                outcome = {
+                    "bucket": bucket, "key": key, "destBucket": target_bucket,
+                    "success": True, "skipped": True, "error": None,
+                }
+            else:
+                obj = src_client.get_object(Bucket=bucket, Key=key)
+                extra_args = {}
+                if obj.get("ContentType"):
+                    extra_args["ContentType"] = obj["ContentType"]
+                if make_public:
+                    extra_args["ACL"] = "public-read"
+
+                callback = None
+                if on_item_progress:
+                    total_bytes = obj.get("ContentLength") or 0
+                    transferred = 0
+                    last_emit = 0.0
+
+                    def callback(bytes_amount: int) -> None:
+                        nonlocal transferred, last_emit
+                        transferred += bytes_amount
+                        now = time.monotonic()
+                        if now - last_emit >= _ITEM_PROGRESS_MIN_INTERVAL or transferred >= total_bytes:
+                            last_emit = now
+                            on_item_progress(key, transferred, total_bytes)
+
+                dst_client.upload_fileobj(
+                    obj["Body"], target_bucket, key, ExtraArgs=extra_args or None, Callback=callback
+                )
+                outcome = {
+                    "bucket": bucket, "key": key, "destBucket": target_bucket,
+                    "success": True, "skipped": False, "error": None,
+                }
+        except Exception as error:  # noqa: BLE001 - one bad object shouldn't abort the whole batch
+            outcome = {
+                "bucket": bucket, "key": key, "destBucket": target_bucket,
+                "success": False, "skipped": False, "error": str(error),
+            }
+        results[index] = outcome
+        with lock:
+            completed += 1
+            done = completed
+        if on_progress:
+            on_progress(done, total, key, outcome["success"], outcome["skipped"])
+
+    if items:
+        workers = min(concurrency or _COPY_CONCURRENCY, len(items))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            list(pool.map(copy_one, range(total)))
+
+    return results

@@ -40,6 +40,54 @@ Upload a previously-downloaded Orphan/Cleanup Candidates report, tick the rows y
 gone, type a literal confirmation phrase, and delete — with a live progress bar and a permanent
 JSON audit trail. See [Delete safety design](#delete-safety-design).
 
+### Copy files to another provider
+Upload a previously-downloaded reconciliation report and read back its `Matched` sheet — files
+already confirmed to exist in both the DB and storage — then copy the selected rows from one
+provider to another (e.g. DigitalOcean -> Wasabi ahead of a migration). `POST /storage/copy` /
+`/storage/copy/stream` never touch the source: nothing is deleted from the old provider, since
+the app's own DB references still point there until they're repointed separately. S3's
+server-side `CopyObject` only works within a single endpoint, so a cross-provider copy streams
+each object through the app instead (`GetObject` from source, a multipart-aware upload to
+destination) — bounded by `STORAGE_COPY_CONCURRENCY`, kept low by default since this moves full
+object bytes rather than just metadata.
+
+**Live per-file progress, not just per-item.** `POST /storage/copy/stream` emits an
+`item_progress` event repeatedly *during* a single file's upload (bytes transferred so far),
+not only once per whole file the way `progress` does — without it, a run with just one large
+file (or a small handful) would leave the UI's progress bar sitting at 0% with no sign of life
+until the transfer was already done.
+
+**The destination bucket doesn't need to exist beforehand.** A tenant's bucket name being
+unchanged across providers doesn't mean the bucket was ever created on the new one — before any
+item is copied, every distinct destination bucket is `HeadBucket`-checked and auto-created if
+missing (region taken from that provider's own config). If creation itself fails (e.g. the
+credential lacks `CreateBucket` permission), every item bound for that bucket fails once with a
+clear "Destination bucket unavailable" message instead of a `NoSuchBucket` error repeated per item.
+
+**Re-uploading the same report is safe.** By default (`overwrite: false`) every item is
+`HeadObject`-checked against the destination first; anything already there is left alone and
+marked `Skipped` instead of re-downloaded/re-uploaded. This is keyed off what's actually sitting
+at the destination, not off which report or file was uploaded, so it also covers a second report
+that happens to overlap an earlier run — not just a literal re-upload of the same `.xlsx`. Pass
+`overwrite: true` to force a fresh copy of every item regardless.
+
+Every run produces two artifacts: a JSON audit trail in `reports/.copies/` (same shape as the
+delete audit log, plus which `.xlsx` report belongs to it) and an `.xlsx` report in
+`reports/` — one row per item with the object's new **Destination URL** (its actual Wasabi link,
+built with `build_object_url` the same way every other report's links are) alongside its status
+(`Copied` / `Skipped` / `Failed`), so it's a direct answer to "what actually moved and where does
+it live now".
+
+To later remove the now-migrated originals from the old provider, `GET /storage/copies` lists
+past copy runs and `GET /storage/copies/{filename}` reads one back split into `succeeded`/
+`failed` items — `succeeded` is exactly the `{bucket, key}` shape `POST /storage/delete` expects
+(pass `provider` as that record's `sourceProvider`), so deleting what was copied still goes
+through the same human-confirmed delete flow as everything else, it just skips re-typing the
+list by hand. This intentionally does *not* re-verify against the database — it only reflects
+what the copy step actually wrote to the destination — so only delete once the app's own DB
+references have actually been repointed at the new provider; re-running Auto reconciliation /
+DO cleanup candidates against the old provider is the safer, DB-verified alternative.
+
 ## How reconciliation works
 
 1. **Discover columns.** `discover_file_columns()` looks for `VARCHAR`/`CHAR`/`TEXT`-family
@@ -170,6 +218,7 @@ All settings are environment variables (see `.env.example` for the full annotate
 | `DB_DATABASE` | — | Optional fixed default; Auto reconciliation can also target a database per-request |
 | `REPORTS_DIR` | `reports` | Where `.xlsx` reports and `.deletions/*.json` audit logs are written |
 | `STORAGE_SUMMARY_CONCURRENCY` | `8` | Parallel S3-compatible API calls |
+| `STORAGE_COPY_CONCURRENCY` | `4` | Parallel object copies between providers (streams full bytes, unlike the summary scan) |
 | `DB_SCAN_CONCURRENCY` | `2` | Parallel MySQL table/column scans — keep low against a production primary |
 | `MAX_CONTENT_SCAN_TABLE_ROWS` | `50000` | Tables at/above this estimated row count skip content scanning |
 
@@ -184,6 +233,11 @@ All settings are environment variables (see `.env.example` for the full annotate
 | POST | `/storage/parse-report` | Parse an uploaded Orphan/Cleanup Candidates report |
 | POST | `/storage/delete` | Delete objects (blocking, single response) |
 | POST | `/storage/delete/stream` | Delete objects (SSE, live progress) |
+| POST | `/storage/parse-matched-report` | Parse an uploaded reconciliation report's Matched sheet |
+| POST | `/storage/copy` | Copy objects to another provider, e.g. DO -> Wasabi (blocking, single response) |
+| POST | `/storage/copy/stream` | Copy objects to another provider (SSE, live progress) |
+| GET | `/storage/copies` | List past copy runs from their `reports/.copies/` audit trail |
+| GET | `/storage/copies/{filename}` | Read one copy run's audit record, split into succeeded/failed items |
 | GET | `/reconciliation/auto/stream` | Auto-discovery reconciliation (SSE) |
 | GET | `/reconciliation/do-cleanup/stream` | DO cleanup candidates scan (SSE) |
 | POST | `/reconciliation/stream` / `/reconciliation` | Manual reconciliation (SSE / blocking) |

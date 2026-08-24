@@ -159,6 +159,22 @@
     background: var(--accent);
     transition: width 0.2s ease;
   }
+  /* Diagonal moving stripes — makes an in-flight transfer read as "actively working" at a
+     glance, distinct from the plain outer bar which only moves once per whole file. */
+  .progress-fill.active-stripe {
+    background-image: linear-gradient(
+      45deg,
+      rgba(255, 255, 255, 0.25) 25%, transparent 25%,
+      transparent 50%, rgba(255, 255, 255, 0.25) 50%,
+      rgba(255, 255, 255, 0.25) 75%, transparent 75%, transparent
+    );
+    background-size: 28px 28px;
+    animation: progress-stripes 0.6s linear infinite;
+  }
+  @keyframes progress-stripes {
+    from { background-position: 28px 0; }
+    to { background-position: 0 0; }
+  }
 </style>
 </head>
 <body>
@@ -311,6 +327,104 @@
     <div id="reconReport"></div>
   </section>
 
+  <section class="card">
+    <h2>Copy files to another provider</h2>
+    <p class="hint">
+      Upload a reconciliation report you already downloaded — this reads its "Matched" sheet back
+      in (files already confirmed to exist in both the database and storage) and copies every one
+      of them to another provider (e.g. DigitalOcean -> Wasabi, ahead of a migration), no review
+      list in between. Nothing is deleted from the source here — update the app's own database
+      references to the new provider separately once you've confirmed the copy worked. Safe to
+      re-run with the same (or an overlapping) report: anything already present at the destination
+      is skipped instead of re-copied, unless "overwrite" below is checked. The destination bucket
+      is created automatically if it doesn't exist yet, and copied files default to publicly
+      readable (a plain object copy doesn't carry the source's ACL over, so without this a file
+      that used to be public silently becomes private and every link to it breaks). Produces a
+      downloadable .xlsx report with every file's new destination link.
+    </p>
+    <div class="row">
+      <div>
+        <label>Report file (.xlsx)</label><br />
+        <input type="file" id="copyFileInput" accept=".xlsx" />
+      </div>
+      <div>
+        <label>Source provider</label><br />
+        <select id="copySourceProvider"><option value="">Loading…</option></select>
+      </div>
+      <div>
+        <label>Destination provider</label><br />
+        <select id="copyDestProvider"><option value="">Loading…</option></select>
+      </div>
+      <div>
+        <label>Destination bucket (optional)</label><br />
+        <input type="text" id="copyDestBucket" placeholder="same as source" size="20" />
+      </div>
+    </div>
+    <div class="row">
+      <div style="align-self:flex-end;">
+        <label><input type="checkbox" id="copyOverwrite" /> overwrite files that already exist at the destination</label>
+      </div>
+      <div style="align-self:flex-end;">
+        <label><input type="checkbox" id="copyMakePublic" checked /> make copied files publicly readable (ACL: public-read)</label>
+      </div>
+      <button id="copyRunBtn" style="align-self:flex-end;">Copy all matched files</button>
+    </div>
+    <div id="copyMsg" class="msg"></div>
+    <div id="copyProgressWrap" style="display:none; margin-top:12px;">
+      <div class="progress-track"><div id="copyProgressBar" class="progress-fill"></div></div>
+      <div id="copyProgressLabel" class="loading"></div>
+      <div id="copyItemProgressWrap" style="margin-top:10px; display:none;">
+        <div class="progress-track" style="height:14px;"><div id="copyItemProgressBar" class="progress-fill active-stripe"></div></div>
+        <div id="copyItemProgressLabel" class="loading" style="font-weight:600; margin-top:4px;"></div>
+      </div>
+    </div>
+    <div id="copyResult" class="msg" style="margin-top:12px;"></div>
+  </section>
+
+  <section class="card" style="border-color:var(--err);">
+    <h2 style="color:var(--err);">Delete files already migrated</h2>
+    <p class="hint">
+      Reads back a past copy run's audit trail (<code>reports/.copies/</code>) so the files it
+      successfully copied can be removed from the source provider. Only delete once you've
+      confirmed the app's own database references have actually been repointed at the new
+      provider — this list is not re-verified against the database, it only reflects what the
+      copy step wrote to the destination at the time.
+    </p>
+    <div class="row">
+      <button id="loadCopiesBtn">Load copy history</button>
+      <select id="copiesSelect" style="min-width:360px; display:none;"></select>
+    </div>
+    <div id="migDeleteMsg" class="msg"></div>
+    <div id="migDeleteTableWrap" style="display:none; overflow-x:auto;">
+      <table id="migDeleteTable">
+        <thead>
+          <tr>
+            <th><input type="checkbox" id="migDeleteSelectAll" /></th>
+            <th>Bucket</th>
+            <th>Key</th>
+            <th>Copied to</th>
+          </tr>
+        </thead>
+        <tbody id="migDeleteTableBody"></tbody>
+      </table>
+    </div>
+    <div id="migDeleteSummary" class="msg" style="margin-top:12px;"></div>
+    <div class="row" style="margin-top:12px; display:none;" id="migDeleteActionRow">
+      <div>
+        <label>Type "HAPUS" to enable delete</label><br />
+        <input type="text" id="migDeleteConfirmInput" placeholder="HAPUS" size="16" />
+      </div>
+      <button class="danger" id="migDeleteRunBtn" style="align-self:flex-end; padding:8px 14px;" disabled>
+        Delete selected from source permanently
+      </button>
+    </div>
+    <div id="migDeleteProgressWrap" style="display:none; margin-top:12px;">
+      <div class="progress-track"><div id="migDeleteProgressBar" class="progress-fill" style="background:var(--err);"></div></div>
+      <div id="migDeleteProgressLabel" class="loading"></div>
+    </div>
+    <div id="migDeleteResult" class="msg" style="margin-top:12px;"></div>
+  </section>
+
   <section class="card" style="border-color:var(--err);">
     <h2 style="color:var(--err);">Delete files from report</h2>
     <p class="hint">
@@ -425,16 +539,39 @@
     return providerSelect.value || null;
   }
 
+  let cachedProviders = [];
+
+  // Fills any <select> with the same provider list. preselectKey picks a specific option
+  // (e.g. "do" / "wasabi" for the copy section's source/destination) when it's configured,
+  // falling back to fallbackIndex (by position) when it isn't — so the copy dropdowns start on
+  // a sensible DO -> Wasabi guess without forcing it when the deployment uses different keys.
+  function populateProviderSelect(select, { preselectKey, fallbackIndex } = {}) {
+    if (!cachedProviders.length) {
+      select.innerHTML = `<option value="">No provider configured</option>`;
+      return;
+    }
+    select.innerHTML = cachedProviders
+      .map((p) => `<option value="${p.key}">${p.label}</option>`)
+      .join("");
+    const preselect = preselectKey && cachedProviders.some((p) => p.key === preselectKey)
+      ? preselectKey
+      : cachedProviders[fallbackIndex ?? 0]?.key;
+    if (preselect) select.value = preselect;
+  }
+
   async function loadProviders() {
     try {
       const { data } = await fetchJson("/storage/providers");
-      if (!data.providers.length) {
+      cachedProviders = data.providers;
+      if (!cachedProviders.length) {
         providerSelect.innerHTML = `<option value="">No provider configured</option>`;
         return;
       }
-      providerSelect.innerHTML = data.providers
+      providerSelect.innerHTML = cachedProviders
         .map((p) => `<option value="${p.key}"${p.isDefault ? " selected" : ""}>${p.label}${p.isDefault ? " (default)" : ""}</option>`)
         .join("");
+      populateProviderSelect(document.getElementById("copySourceProvider"), { preselectKey: "do", fallbackIndex: 0 });
+      populateProviderSelect(document.getElementById("copyDestProvider"), { preselectKey: "wasabi", fallbackIndex: cachedProviders.length > 1 ? 1 : 0 });
     } catch (err) {
       providerSelect.innerHTML = `<option value="">Failed to load providers</option>`;
     }
@@ -771,8 +908,307 @@
     }
   });
 
-  // --- Delete files from report ---
+  // Shared by both destructive-delete sections below (migrated-files delete and report delete).
   const DELETE_CONFIRM_PHRASE = "HAPUS";
+
+  // --- Copy files to another provider ---
+  const copyFileInput = document.getElementById("copyFileInput");
+  const copyMsg = document.getElementById("copyMsg");
+  const copySourceProvider = document.getElementById("copySourceProvider");
+  const copyDestProvider = document.getElementById("copyDestProvider");
+  const copyDestBucket = document.getElementById("copyDestBucket");
+  const copyRunBtn = document.getElementById("copyRunBtn");
+  const copyProgressWrap = document.getElementById("copyProgressWrap");
+  const copyProgressBar = document.getElementById("copyProgressBar");
+  const copyProgressLabel = document.getElementById("copyProgressLabel");
+  const copyItemProgressWrap = document.getElementById("copyItemProgressWrap");
+  const copyItemProgressBar = document.getElementById("copyItemProgressBar");
+  const copyItemProgressLabel = document.getElementById("copyItemProgressLabel");
+  const copyResult = document.getElementById("copyResult");
+
+  // Uploading a report goes straight to copying every "Matched" row it contains — no
+  // review-and-tick step in between. Copy never touches the source (see the hint text above),
+  // so skipping that review is a reasonable default the way it wouldn't be for delete.
+  copyRunBtn.addEventListener("click", async () => {
+    const file = copyFileInput.files[0];
+    const sourceProvider = copySourceProvider.value;
+    const destProvider = copyDestProvider.value;
+
+    copyResult.textContent = "";
+    copyResult.className = "msg";
+
+    if (!file) {
+      copyMsg.textContent = "Pick a report file (.xlsx) first.";
+      copyMsg.className = "msg err";
+      return;
+    }
+    if (!sourceProvider || !destProvider) {
+      copyMsg.textContent = "Pick both a source and destination provider.";
+      copyMsg.className = "msg err";
+      return;
+    }
+    if (sourceProvider === destProvider) {
+      copyMsg.textContent = "Source and destination provider must be different.";
+      copyMsg.className = "msg err";
+      return;
+    }
+
+    copyRunBtn.disabled = true;
+    copyMsg.textContent = "Parsing report…";
+    copyMsg.className = "msg";
+
+    let items;
+    try {
+      const formData = new FormData();
+      formData.append("file", file);
+      const body = await fetchJson("/storage/parse-matched-report", { method: "POST", body: formData });
+      items = body.data.rows.map((row) => ({
+        bucket: row.bucket, key: row.key, sizeMb: row.sizeMb, path: row.rawValue,
+      }));
+    } catch (err) {
+      copyMsg.textContent = err.message;
+      copyMsg.className = "msg err";
+      copyRunBtn.disabled = false;
+      return;
+    }
+
+    if (items.length === 0) {
+      copyMsg.textContent = "No Matched rows found in this report — nothing to copy.";
+      copyRunBtn.disabled = false;
+      return;
+    }
+
+    copyMsg.textContent = `Copying ${items.length} file(s) from "${file.name}"…`;
+    copyProgressWrap.style.display = "block";
+    copyProgressBar.style.width = "0%";
+    copyProgressLabel.textContent = `0 / ${items.length} processed (0%)`;
+    copyItemProgressWrap.style.display = "none";
+    copyItemProgressBar.style.width = "0%";
+    copyItemProgressLabel.textContent = "";
+
+    try {
+      const payload = {
+        items, sourceProvider, destProvider,
+        overwrite: document.getElementById("copyOverwrite").checked,
+        makePublic: document.getElementById("copyMakePublic").checked,
+      };
+      const destBucket = copyDestBucket.value.trim();
+      if (destBucket) payload.destBucket = destBucket;
+
+      await fetchSse(
+        "/storage/copy/stream",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        },
+        {
+          item_progress: (d) => {
+            // Fires repeatedly *during* a single file's upload — without this, a run with only
+            // a handful of large files (or just 1) would leave the bar stuck at 0% the whole
+            // time with no sign anything is happening.
+            copyItemProgressWrap.style.display = "block";
+            copyItemProgressBar.style.width = `${d.percent}%`;
+            copyItemProgressLabel.textContent =
+              `Uploading ${d.key} — ${formatBytes(d.bytesTransferred)} / ${formatBytes(d.totalBytes)} (${d.percent}%)`;
+          },
+          progress: (d) => {
+            copyProgressBar.style.width = `${d.percent}%`;
+            const status = !d.success ? " (failed)" : d.skipped ? " (already at destination, skipped)" : "";
+            copyProgressLabel.textContent = `${d.completed} / ${d.total} processed (${d.percent}%) — ${d.key}${status}`;
+            copyItemProgressWrap.style.display = "none";
+          },
+          done: (d) => {
+            const { succeededCount, skippedCount, failedCount, auditFile, reportFile } = d;
+            const copiedCount = succeededCount - skippedCount;
+            copyMsg.textContent = "";
+            copyResult.innerHTML =
+              `Copied ${copiedCount} file(s) to ${destProvider}` +
+              `${skippedCount ? `, ${skippedCount} already there (skipped)` : ""}` +
+              `${failedCount ? `, ${failedCount} failed` : ""}. Audit log: ${auditFile}` +
+              (reportFile ? ` — ${reportLink(reportFile)}` : "");
+            copyResult.className = failedCount ? "msg err" : "msg ok";
+          },
+        },
+      );
+    } catch (err) {
+      copyResult.textContent = err.message;
+      copyResult.className = "msg err";
+    } finally {
+      copyProgressWrap.style.display = "none";
+      copyRunBtn.disabled = false;
+    }
+  });
+
+  // --- Delete files already migrated (reads back a copy run, deletes from its source provider) ---
+  const loadCopiesBtn = document.getElementById("loadCopiesBtn");
+  const copiesSelect = document.getElementById("copiesSelect");
+  const migDeleteMsg = document.getElementById("migDeleteMsg");
+  const migDeleteTableWrap = document.getElementById("migDeleteTableWrap");
+  const migDeleteTableBody = document.getElementById("migDeleteTableBody");
+  const migDeleteSelectAll = document.getElementById("migDeleteSelectAll");
+  const migDeleteSummary = document.getElementById("migDeleteSummary");
+  const migDeleteActionRow = document.getElementById("migDeleteActionRow");
+  const migDeleteConfirmInput = document.getElementById("migDeleteConfirmInput");
+  const migDeleteRunBtn = document.getElementById("migDeleteRunBtn");
+  const migDeleteProgressWrap = document.getElementById("migDeleteProgressWrap");
+  const migDeleteProgressBar = document.getElementById("migDeleteProgressBar");
+  const migDeleteProgressLabel = document.getElementById("migDeleteProgressLabel");
+  const migDeleteResult = document.getElementById("migDeleteResult");
+
+  let migDeleteRows = []; // {bucket, key, destBucket} — the "succeeded" items from the selected copy run
+  let migDeleteSourceProvider = null;
+
+  function checkedMigDeleteBoxes() {
+    return Array.from(migDeleteTableBody.querySelectorAll("input[type=checkbox]"));
+  }
+
+  function updateMigDeleteState() {
+    const boxes = checkedMigDeleteBoxes();
+    const checked = boxes.filter((cb) => cb.checked);
+    migDeleteSummary.textContent = checked.length ? `${checked.length} file(s) selected` : "";
+    migDeleteSelectAll.checked = boxes.length > 0 && checked.length === boxes.length;
+    const confirmed = migDeleteConfirmInput.value.trim() === DELETE_CONFIRM_PHRASE;
+    migDeleteRunBtn.disabled = !(checked.length > 0 && confirmed);
+  }
+
+  migDeleteConfirmInput.addEventListener("input", updateMigDeleteState);
+
+  loadCopiesBtn.addEventListener("click", async () => {
+    migDeleteMsg.textContent = "Loading…";
+    migDeleteMsg.className = "msg";
+    copiesSelect.style.display = "none";
+    migDeleteTableWrap.style.display = "none";
+    migDeleteActionRow.style.display = "none";
+    migDeleteResult.textContent = "";
+
+    try {
+      const { data } = await fetchJson("/storage/copies");
+      if (!data.copies.length) {
+        migDeleteMsg.textContent = "No copy runs found yet — use \"Copy files to another provider\" above first.";
+        return;
+      }
+      copiesSelect.innerHTML = data.copies
+        .map((c) => `<option value="${c.file}">${c.timestamp ?? c.file} — ${c.sourceProvider} → ${c.destProvider} (${c.succeededCount} succeeded incl. ${c.skippedCount} skipped, ${c.failedCount} failed)</option>`)
+        .join("");
+      copiesSelect.style.display = "inline-block";
+      migDeleteMsg.textContent = `${data.copies.length} copy run(s) found. Pick one to load its successfully-copied files.`;
+      migDeleteMsg.className = "msg ok";
+      copiesSelect.dispatchEvent(new Event("change"));
+    } catch (err) {
+      migDeleteMsg.textContent = err.message;
+      migDeleteMsg.className = "msg err";
+    }
+  });
+
+  copiesSelect.addEventListener("change", async () => {
+    const file = copiesSelect.value;
+    if (!file) return;
+
+    migDeleteMsg.textContent = "Loading copy run…";
+    migDeleteMsg.className = "msg";
+    migDeleteTableWrap.style.display = "none";
+    migDeleteTableBody.innerHTML = "";
+    migDeleteActionRow.style.display = "none";
+    migDeleteConfirmInput.value = "";
+    migDeleteResult.textContent = "";
+    migDeleteRows = [];
+
+    try {
+      const { data } = await fetchJson(`/storage/copies/${encodeURIComponent(file)}`);
+      migDeleteSourceProvider = data.sourceProvider;
+      migDeleteRows = data.succeeded;
+
+      if (migDeleteRows.length === 0) {
+        migDeleteMsg.textContent = "This copy run has no successfully-copied files to delete.";
+        return;
+      }
+
+      migDeleteRows.forEach((row, i) => {
+        const tr = document.createElement("tr");
+        tr.innerHTML = `
+          <td><input type="checkbox" data-index="${i}" /></td>
+          <td>${row.bucket}</td>
+          <td style="word-break:break-all;">${row.key}</td>
+          <td>${data.destProvider}${row.destBucket ? " / " + row.destBucket : ""}</td>
+        `;
+        tr.querySelector("input[type=checkbox]").addEventListener("change", updateMigDeleteState);
+        migDeleteTableBody.appendChild(tr);
+      });
+
+      migDeleteTableWrap.style.display = "block";
+      migDeleteActionRow.style.display = "flex";
+      migDeleteMsg.textContent =
+        `${migDeleteRows.length} file(s) copied from ${data.sourceProvider} to ${data.destProvider}. ` +
+        `Only delete these once the database references are confirmed repointed at ${data.destProvider}.`;
+      migDeleteMsg.className = "msg ok";
+      updateMigDeleteState();
+    } catch (err) {
+      migDeleteMsg.textContent = err.message;
+      migDeleteMsg.className = "msg err";
+    }
+  });
+
+  migDeleteSelectAll.addEventListener("change", () => {
+    checkedMigDeleteBoxes().forEach((cb) => { cb.checked = migDeleteSelectAll.checked; });
+    updateMigDeleteState();
+  });
+
+  migDeleteRunBtn.addEventListener("click", async () => {
+    const checked = checkedMigDeleteBoxes().filter((cb) => cb.checked);
+    const items = checked.map((cb) => {
+      const row = migDeleteRows[Number(cb.dataset.index)];
+      return { bucket: row.bucket, key: row.key };
+    });
+
+    if (!confirm(`Permanently delete ${items.length} file(s) from ${migDeleteSourceProvider}? This cannot be undone.`)) return;
+
+    migDeleteRunBtn.disabled = true;
+    migDeleteResult.textContent = "";
+    migDeleteProgressWrap.style.display = "block";
+    migDeleteProgressBar.style.width = "0%";
+    migDeleteProgressLabel.textContent = `0 / ${items.length} deleted (0%)`;
+
+    try {
+      const payload = { items, confirm: migDeleteConfirmInput.value.trim(), provider: migDeleteSourceProvider };
+
+      await fetchSse(
+        "/storage/delete/stream",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        },
+        {
+          progress: (d) => {
+            migDeleteProgressBar.style.width = `${d.percent}%`;
+            migDeleteProgressLabel.textContent = `${d.completed} / ${d.total} deleted (${d.percent}%) — ${d.bucket}`;
+          },
+          done: (d) => {
+            const { succeededCount, failedCount, auditFile, results } = d;
+            migDeleteResult.textContent =
+              `Deleted ${succeededCount} file(s) from ${migDeleteSourceProvider}${failedCount ? `, ${failedCount} failed` : ""}. Audit log: ${auditFile}`;
+            migDeleteResult.className = failedCount ? "msg err" : "msg ok";
+
+            results.forEach((r, i) => {
+              if (r.success) checked[i].closest("tr").remove();
+            });
+            migDeleteRows = migDeleteRows.filter(
+              (row) => !results.some((r) => r.success && r.bucket === row.bucket && r.key === row.key)
+            );
+          },
+        },
+      );
+    } catch (err) {
+      migDeleteResult.textContent = err.message;
+      migDeleteResult.className = "msg err";
+    } finally {
+      migDeleteProgressWrap.style.display = "none";
+      updateMigDeleteState();
+    }
+  });
+
+  // --- Delete files from report ---
   const deleteFileInput = document.getElementById("deleteFileInput");
   const deleteMsg = document.getElementById("deleteMsg");
   const deleteTableWrap = document.getElementById("deleteTableWrap");

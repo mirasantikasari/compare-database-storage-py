@@ -63,6 +63,7 @@ class Env:
     db: DbConfig
     reports_dir: str
     storage_summary_concurrency: int
+    storage_copy_concurrency: int
     db_scan_concurrency: int
     max_content_scan_table_rows: int
 
@@ -94,6 +95,11 @@ def _load_env() -> Env:
         ),
         reports_dir=os.environ.get("REPORTS_DIR", "reports"),
         storage_summary_concurrency=int(os.environ.get("STORAGE_SUMMARY_CONCURRENCY", "8")),
+        # Separate from storage_summary_concurrency: that one only ever lists metadata, while a
+        # cross-provider copy streams each object's full bytes through the app (GET from source,
+        # PUT to destination) — too much parallel data transfer can saturate the app's own network
+        # link rather than either provider, so this defaults lower.
+        storage_copy_concurrency=int(os.environ.get("STORAGE_COPY_CONCURRENCY", "4")),
         # Deliberately separate from storage_summary_concurrency (which only ever calls out to
         # S3-compatible APIs — safe to parallelize aggressively). This one bounds how many
         # simultaneous full-column table scans hit the *production* MySQL server at once, so it
