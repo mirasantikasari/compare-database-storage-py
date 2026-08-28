@@ -180,7 +180,7 @@
 <body>
 <header>
   <h1>Object Storage & MySQL Reconciler</h1>
-  <p>Read-only audit dashboard — nothing here deletes, modifies, or uploads objects.</p>
+  <p>Object Storage audit, migration, and guarded database-reference maintenance.</p>
 </header>
 
 <main>
@@ -379,6 +379,41 @@
       </div>
     </div>
     <div id="copyResult" class="msg" style="margin-top:12px;"></div>
+  </section>
+
+  <section class="card" style="border-color:var(--warn);">
+    <h2>Update database URLs after migration</h2>
+    <p class="hint">
+      Upload the completed storage migration report. Only <code>Copied</code>/<code>Skipped</code>
+      rows with Table, Column, and Row ID are eligible. Each database value must still exactly
+      match Source Path before it is changed to Destination URL; changed rows are reported as
+      conflicts and left untouched. The run is transactional.
+    </p>
+    <div class="row">
+      <div>
+        <label>Migration report (.xlsx)</label><br />
+        <input type="file" id="dbUpdateFileInput" accept=".xlsx" />
+      </div>
+      <div>
+        <label>Database</label><br />
+        <select id="dbUpdateDatabase"><option value="">Loading…</option></select>
+      </div>
+      <div id="dbUpdateManualWrap" style="display:none;">
+        <label>Database name</label><br />
+        <input type="text" id="dbUpdateManualDatabase" placeholder="my_database" size="24" />
+      </div>
+      <div>
+        <label>Type <strong>UPDATE URL</strong> to confirm</label><br />
+        <input type="text" id="dbUpdateConfirm" placeholder="UPDATE URL" size="16" autocomplete="off" />
+      </div>
+      <button id="dbUpdateRunBtn" style="align-self:flex-end;">Update database URLs</button>
+    </div>
+    <div id="dbUpdateMsg" class="msg"></div>
+    <div id="dbUpdateProgressWrap" style="display:none;">
+      <div class="progress-track"><div id="dbUpdateProgressBar" class="progress-fill"></div></div>
+      <div id="dbUpdateProgressLabel" class="loading"></div>
+    </div>
+    <div id="dbUpdateStats" class="stat-row"></div>
   </section>
 
   <section class="card" style="border-color:var(--err);">
@@ -1038,6 +1073,124 @@
     } finally {
       copyProgressWrap.style.display = "none";
       copyRunBtn.disabled = false;
+    }
+  });
+
+  // --- Update database URLs from a completed storage migration report ---
+  const dbUpdateFileInput = document.getElementById("dbUpdateFileInput");
+  const dbUpdateDatabase = document.getElementById("dbUpdateDatabase");
+  const dbUpdateManualWrap = document.getElementById("dbUpdateManualWrap");
+  const dbUpdateManualDatabase = document.getElementById("dbUpdateManualDatabase");
+  const dbUpdateConfirm = document.getElementById("dbUpdateConfirm");
+  const dbUpdateRunBtn = document.getElementById("dbUpdateRunBtn");
+  const dbUpdateMsg = document.getElementById("dbUpdateMsg");
+  const dbUpdateProgressWrap = document.getElementById("dbUpdateProgressWrap");
+  const dbUpdateProgressBar = document.getElementById("dbUpdateProgressBar");
+  const dbUpdateProgressLabel = document.getElementById("dbUpdateProgressLabel");
+  const dbUpdateStats = document.getElementById("dbUpdateStats");
+
+  function selectedUpdateDatabase() {
+    return dbUpdateDatabase.value === "__manual__"
+      ? dbUpdateManualDatabase.value.trim()
+      : dbUpdateDatabase.value;
+  }
+
+  dbUpdateDatabase.addEventListener("change", () => {
+    dbUpdateManualWrap.style.display = dbUpdateDatabase.value === "__manual__" ? "block" : "none";
+  });
+
+  async function loadDatabases() {
+    try {
+      const { data } = await fetchJson("/storage/databases");
+      const options = data.databases
+        .map((name) => `<option value="${name}"${name === data.defaultDatabase ? " selected" : ""}>${name}</option>`)
+        .join("");
+      dbUpdateDatabase.innerHTML = options + `<option value="__manual__">Enter manually…</option>`;
+      if (!data.databases.length) {
+        dbUpdateDatabase.value = "__manual__";
+        dbUpdateManualWrap.style.display = "block";
+      }
+    } catch (err) {
+      dbUpdateDatabase.innerHTML = `<option value="__manual__">Enter manually…</option>`;
+      dbUpdateDatabase.value = "__manual__";
+      dbUpdateManualWrap.style.display = "block";
+      dbUpdateMsg.textContent = `Could not load database list: ${err.message}`;
+      dbUpdateMsg.className = "msg err";
+    }
+  }
+  loadDatabases();
+
+  dbUpdateRunBtn.addEventListener("click", async () => {
+    const file = dbUpdateFileInput.files[0];
+    const database = selectedUpdateDatabase();
+    dbUpdateMsg.textContent = "";
+    dbUpdateMsg.className = "msg";
+    dbUpdateStats.innerHTML = "";
+
+    if (!file) {
+      dbUpdateMsg.textContent = "Pick a storage migration report (.xlsx) first.";
+      dbUpdateMsg.className = "msg err";
+      return;
+    }
+    if (!database) {
+      dbUpdateMsg.textContent = "Select or enter a database name.";
+      dbUpdateMsg.className = "msg err";
+      return;
+    }
+    if (dbUpdateConfirm.value !== "UPDATE URL") {
+      dbUpdateMsg.textContent = 'Type "UPDATE URL" exactly to confirm.';
+      dbUpdateMsg.className = "msg err";
+      return;
+    }
+
+    dbUpdateRunBtn.disabled = true;
+    dbUpdateMsg.textContent = "Validating migration report…";
+    try {
+      const formData = new FormData();
+      formData.append("file", file);
+      const parsed = await fetchJson("/storage/parse-copy-report", { method: "POST", body: formData });
+      const { rows, total, eligible, failed, incomplete } = parsed.data;
+      if (!eligible) {
+        throw new Error(`No eligible rows (${total} total, ${failed} failed, ${incomplete} incomplete).`);
+      }
+
+      dbUpdateMsg.textContent =
+        `Validated ${eligible} eligible row(s) from ${total}; updating database "${database}"…`;
+      dbUpdateProgressWrap.style.display = "block";
+      dbUpdateProgressBar.style.width = "0%";
+      dbUpdateProgressLabel.textContent = `0 / ${eligible} processed (0%)`;
+
+      await fetchSse(
+        "/storage/update-database-urls/stream",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ database, items: rows, confirm: dbUpdateConfirm.value }),
+        },
+        {
+          progress: (d) => {
+            dbUpdateProgressBar.style.width = `${d.percent}%`;
+            dbUpdateProgressLabel.textContent =
+              `${d.completed} / ${d.total} processed (${d.percent}%) — ${d.outcome}`;
+          },
+          done: (d) => {
+            dbUpdateMsg.textContent = "Database URL update completed.";
+            dbUpdateMsg.className = d.conflict || d.missing ? "msg err" : "msg ok";
+            dbUpdateStats.innerHTML = `
+              <div class="stat ok"><div class="n">${d.updated.toLocaleString()}</div><div class="l">updated</div></div>
+              <div class="stat"><div class="n">${d.alreadyUpdated.toLocaleString()}</div><div class="l">already updated</div></div>
+              <div class="stat warn"><div class="n">${d.conflict.toLocaleString()}</div><div class="l">conflicts skipped</div></div>
+              <div class="stat err"><div class="n">${d.missing.toLocaleString()}</div><div class="l">rows missing</div></div>
+            `;
+          },
+        },
+      );
+    } catch (err) {
+      dbUpdateMsg.textContent = err.message;
+      dbUpdateMsg.className = "msg err";
+    } finally {
+      dbUpdateRunBtn.disabled = false;
+      dbUpdateProgressWrap.style.display = "none";
     }
   });
 
