@@ -347,6 +347,12 @@ class CopyItem(BaseModel):
     # and carried into the audit log, never used to decide what gets copied.
     sizeMb: str | float | int | None = None
     path: str | None = None
+    # Database-reference metadata from the uploaded reconciliation report. It does not affect
+    # the object copy itself, but is preserved in both the audit log and migration report so a
+    # migrated object can still be traced back to the exact source row.
+    table: str | None = None
+    column: str | None = None
+    rowId: str | float | int | None = None
 
 
 class CopyBody(BaseModel):
@@ -413,6 +419,9 @@ def _build_copy_report(body: CopyBody, results: list[dict]) -> str:
                 "key": result["key"],
                 "destBucket": result.get("destBucket"),
                 "sizeMb": item.sizeMb,
+                "table": item.table,
+                "column": item.column,
+                "rowId": item.rowId,
                 "status": status,
                 "error": result.get("error"),
             }
