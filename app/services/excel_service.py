@@ -149,7 +149,7 @@ def generate_copy_report(entries: list[dict], dest_provider: str | None, file_na
     """
     One row per item a /storage/copy(/stream) run was asked to handle, deliverable for "what
     actually got moved to the new provider and where does it live now" — each entry is:
-    {sourcePath, bucket, key, destBucket, sizeMb, status, error} where status is "Copied"
+    {sourcePath, bucket, key, destBucket, sizeMb, table, column, rowId, status, error} where status is "Copied"
     (freshly transferred), "Skipped" (already existed at the destination — see copy_objects'
     overwrite=False default), or "Failed". The Destination URL column is built the same way
     every other report's clickable link is (build_object_url) and is shown even for a Failed row
@@ -161,9 +161,12 @@ def generate_copy_report(entries: list[dict], dest_provider: str | None, file_na
     sheet = workbook.active
     sheet.title = "Copied"
 
-    headers = ["Source Path", "Bucket", "Key", "Destination URL", "Size (MB)", "Status", "Error"]
+    headers = [
+        "Source Path", "Bucket", "Key", "Destination URL", "Size (MB)",
+        "Table", "Column", "Row ID", "Status", "Error",
+    ]
     sheet.append(headers)
-    widths = [55, 20, 45, 55, 12, 12, 30]
+    widths = [55, 20, 45, 55, 12, 24, 24, 16, 12, 30]
     for idx, width in enumerate(widths, start=1):
         sheet.column_dimensions[sheet.cell(row=1, column=idx).column_letter].width = width
 
@@ -181,6 +184,9 @@ def generate_copy_report(entries: list[dict], dest_provider: str | None, file_na
                 entry["key"],
                 dest_url or "",
                 entry.get("sizeMb"),
+                entry.get("table") or "",
+                entry.get("column") or "",
+                entry.get("rowId") if entry.get("rowId") is not None else "",
                 status,
                 entry.get("error") or "",
             ]
@@ -194,7 +200,7 @@ def generate_copy_report(entries: list[dict], dest_provider: str | None, file_na
             cell.hyperlink = dest_url
             cell.font = _HYPERLINK_FONT
         if status == "Failed":
-            sheet.cell(row=row_idx, column=6).font = _RED
+            sheet.cell(row=row_idx, column=9).font = _RED
 
     _style_header_row(sheet)
 
@@ -574,10 +580,15 @@ def parse_matched_report(file_obj) -> list[dict]:
     if path_col is None or "bucket" not in col_index:
         raise ValueError(f"'{_MATCHED_SHEET_NAME}' sheet is missing expected column(s): path, bucket")
 
+    def cell_value(row, column_name: str):
+        """Return None when an edited/blank Excel row ends before the requested column."""
+        index = col_index.get(column_name)
+        return row[index] if index is not None and index < len(row) else None
+
     results = []
     for row in rows_iter:
-        raw_value = row[col_index[path_col]]
-        bucket = row[col_index["bucket"]]
+        raw_value = cell_value(row, path_col)
+        bucket = cell_value(row, "bucket")
         if not raw_value or not bucket:
             continue
         _url_bucket, key, _provider_hint = _split_object_reference(str(raw_value))
@@ -588,13 +599,13 @@ def parse_matched_report(file_obj) -> list[dict]:
                 "rawValue": raw_value,
                 "bucket": bucket,
                 "key": key,
-                "sizeMb": row[col_index["size (mb)"]] if "size (mb)" in col_index else None,
+                "sizeMb": cell_value(row, "size (mb)"),
                 "lastModified": (
-                    str(row[col_index["last modified"]]) if "last modified" in col_index and row[col_index["last modified"]] is not None else None
+                    str(cell_value(row, "last modified")) if cell_value(row, "last modified") is not None else None
                 ),
-                "table": row[col_index["table"]] if "table" in col_index else None,
-                "column": row[col_index["column"]] if "column" in col_index else None,
-                "rowId": row[col_index["row id"]] if "row id" in col_index else None,
+                "table": cell_value(row, "table"),
+                "column": cell_value(row, "column"),
+                "rowId": cell_value(row, "row id"),
             }
         )
     return results

@@ -964,6 +964,7 @@
       const body = await fetchJson("/storage/parse-matched-report", { method: "POST", body: formData });
       items = body.data.rows.map((row) => ({
         bucket: row.bucket, key: row.key, sizeMb: row.sizeMb, path: row.rawValue,
+        table: row.table, column: row.column, rowId: row.rowId,
       }));
     } catch (err) {
       copyMsg.textContent = err.message;
