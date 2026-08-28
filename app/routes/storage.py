@@ -16,9 +16,11 @@ from app.services.excel_service import (
     buckets_label,
     generate_copy_report,
     generate_storage_report,
+    parse_copy_report_for_db_update,
     parse_deletable_report,
     parse_matched_report,
 )
+from app.services.mysql_service import list_databases, update_migrated_urls
 from app.services.sse import sse_stream
 from app.services.storage_service import (
     _DELETE_STREAM_BATCH_SIZE,
@@ -34,6 +36,7 @@ from app.types import BucketSummary, StorageSummary
 router = APIRouter(prefix="/storage")
 
 _DELETE_CONFIRM_PHRASE = "HAPUS"
+_UPDATE_URL_CONFIRM_PHRASE = "UPDATE URL"
 
 
 def _split_buckets(raw: str | None) -> list[str] | None:
@@ -45,6 +48,15 @@ def _split_buckets(raw: str | None) -> list[str] | None:
 @router.get("/providers")
 async def get_providers():
     return {"status": True, "data": {"providers": list_s3_providers()}}
+
+
+@router.get("/databases")
+async def get_databases():
+    databases = await asyncio.to_thread(list_databases)
+    return {
+        "status": True,
+        "data": {"databases": databases, "count": len(databases), "defaultDatabase": env.db.database},
+    }
 
 
 @router.get("/buckets")
@@ -222,6 +234,17 @@ async def parse_matched_report_route(file: UploadFile = File(...)):
     return {"status": True, "data": {"rows": rows, "count": len(rows)}}
 
 
+@router.post("/parse-copy-report")
+async def parse_copy_report_route(file: UploadFile = File(...)):
+    """Validates a storage-migration report and extracts safe database-update candidates."""
+    content = await file.read()
+    try:
+        rows, stats = await asyncio.to_thread(parse_copy_report_for_db_update, io.BytesIO(content))
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    return {"status": True, "data": {"rows": rows, **stats}}
+
+
 class DeleteItem(BaseModel):
     bucket: str
     key: str
@@ -371,6 +394,20 @@ class CopyBody(BaseModel):
     # preserves the source's own ACL — without this, files that were publicly readable on the
     # source silently become private (default ACL) on the destination and every link to them breaks.
     makePublic: bool = True
+
+
+class DatabaseUrlUpdateItem(BaseModel):
+    sourcePath: str
+    destinationUrl: str
+    table: str
+    column: str
+    rowId: str | float | int
+
+
+class DatabaseUrlUpdateBody(BaseModel):
+    database: str
+    items: list[DatabaseUrlUpdateItem]
+    confirm: str
 
 
 def _validate_copy_body(body: CopyBody) -> None:
@@ -530,6 +567,45 @@ async def copy_stream(body: CopyBody):
                 "reportFile": report_file,
             },
         )
+
+    return StreamingResponse(
+        sse_stream(work),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+    )
+
+
+@router.post("/update-database-urls/stream")
+async def update_database_urls_stream(body: DatabaseUrlUpdateBody):
+    """Repoints DB file URLs from a completed copy report, with guarded transactional updates."""
+    if body.confirm != _UPDATE_URL_CONFIRM_PHRASE:
+        raise HTTPException(
+            status_code=400,
+            detail=f'Type "{_UPDATE_URL_CONFIRM_PHRASE}" exactly to confirm database updates',
+        )
+    if not body.database.strip():
+        raise HTTPException(status_code=400, detail="Database name is required")
+    if not body.items:
+        raise HTTPException(status_code=400, detail="No eligible migration rows to update")
+
+    def work(emit):
+        def on_progress(completed: int, total: int, outcome: str) -> None:
+            emit(
+                "progress",
+                {
+                    "completed": completed,
+                    "total": total,
+                    "percent": round((completed / total) * 100) if total else 100,
+                    "outcome": outcome,
+                },
+            )
+
+        counts = update_migrated_urls(
+            body.database.strip(),
+            [item.model_dump() for item in body.items],
+            on_progress,
+        )
+        emit("done", counts)
 
     return StreamingResponse(
         sse_stream(work),

@@ -1,5 +1,5 @@
 import re
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 
 import pymysql
 from dbutils.pooled_db import PooledDB
@@ -32,6 +32,8 @@ _pool = PooledDB(
     autocommit=True,
 )
 
+_SYSTEM_DATABASES = {"information_schema", "mysql", "performance_schema", "sys"}
+
 
 def _assert_valid_identifier(name: str, label: str) -> None:
     if not IDENTIFIER_PATTERN.match(name):
@@ -40,6 +42,124 @@ def _assert_valid_identifier(name: str, label: str) -> None:
 
 def _escape_id(name: str) -> str:
     return f"`{name.replace('`', '``')}`"
+
+
+def list_databases() -> list[str]:
+    """Lists non-system databases visible to the configured MySQL credential."""
+    conn = _pool.connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("SHOW DATABASES")
+            rows = cursor.fetchall()
+    finally:
+        conn.close()
+
+    names = [next(iter(row.values())) for row in rows]
+    return sorted(name for name in names if name not in _SYSTEM_DATABASES)
+
+
+def update_migrated_urls(
+    database: str,
+    items: list[dict],
+    on_progress: Callable[[int, int, str], None] | None = None,
+) -> dict[str, int]:
+    """
+    Repoints dedicated file-reference columns using a completed storage-copy report.
+
+    Every update is guarded by both Row ID and the original Source Path. A row whose value has
+    changed since the report was generated is classified as a conflict and is never overwritten.
+    Single-column primary keys are discovered from information_schema; for legacy tables without
+    a declared primary key, an `id` column is accepted as the fallback used by reconciliation.
+    The whole run is transactional, so an unexpected database error cannot leave a half-applied
+    report.
+    """
+    _assert_valid_identifier(database, "database")
+    if not items:
+        return {"updated": 0, "alreadyUpdated": 0, "conflict": 0, "missing": 0, "total": 0}
+
+    for item in items:
+        _assert_valid_identifier(str(item["table"]), "table")
+        _assert_valid_identifier(str(item["column"]), "column")
+
+    conn = _pool.connection()
+    try:
+        # Resolve and validate every target before starting any writes.
+        targets: dict[str, tuple[str, set[str]]] = {}
+        with conn.cursor() as cursor:
+            for table in sorted({str(item["table"]) for item in items}):
+                cursor.execute(
+                    """
+                    SELECT COLUMN_NAME AS columnName, COLUMN_KEY AS columnKey
+                    FROM information_schema.COLUMNS
+                    WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s
+                    ORDER BY ORDINAL_POSITION
+                    """,
+                    [database, table],
+                )
+                columns = cursor.fetchall()
+                if not columns:
+                    raise ValueError(f'Table "{database}.{table}" does not exist or is not accessible')
+                names = {row["columnName"] for row in columns}
+                primary_keys = [row["columnName"] for row in columns if row["columnKey"] == "PRI"]
+                if len(primary_keys) == 1:
+                    id_column = primary_keys[0]
+                elif not primary_keys and "id" in names:
+                    id_column = "id"
+                else:
+                    raise ValueError(
+                        f'Table "{database}.{table}" needs one primary key (or an id column) '
+                        "to safely match the report's Row ID"
+                    )
+                targets[table] = (id_column, names)
+
+            for item in items:
+                table = str(item["table"])
+                column = str(item["column"])
+                if column not in targets[table][1]:
+                    raise ValueError(f'Column "{database}.{table}.{column}" does not exist')
+
+        counts = {"updated": 0, "alreadyUpdated": 0, "conflict": 0, "missing": 0, "total": len(items)}
+        conn.begin()
+        try:
+            with conn.cursor() as cursor:
+                for index, item in enumerate(items, start=1):
+                    table = str(item["table"])
+                    column = str(item["column"])
+                    id_column = targets[table][0]
+                    qualified_table = f"{_escape_id(database)}.{_escape_id(table)}"
+                    escaped_column = _escape_id(column)
+                    escaped_id = _escape_id(id_column)
+
+                    cursor.execute(
+                        f"SELECT {escaped_column} AS currentValue FROM {qualified_table} WHERE {escaped_id} = %s",
+                        [item["rowId"]],
+                    )
+                    row = cursor.fetchone()
+                    if row is None:
+                        outcome = "missing"
+                    else:
+                        current = row["currentValue"]
+                        if current == item["destinationUrl"]:
+                            outcome = "alreadyUpdated"
+                        elif current != item["sourcePath"]:
+                            outcome = "conflict"
+                        else:
+                            cursor.execute(
+                                f"UPDATE {qualified_table} SET {escaped_column} = %s "
+                                f"WHERE {escaped_id} = %s AND {escaped_column} = %s",
+                                [item["destinationUrl"], item["rowId"], item["sourcePath"]],
+                            )
+                            outcome = "updated" if cursor.rowcount == 1 else "conflict"
+                    counts[outcome] += 1
+                    if on_progress:
+                        on_progress(index, len(items), outcome)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        return counts
+    finally:
+        conn.close()
 
 
 def fetch_file_references(

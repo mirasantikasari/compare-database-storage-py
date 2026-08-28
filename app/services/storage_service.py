@@ -295,15 +295,17 @@ def copy_objects(
     report that happens to cover the same objects. Set overwrite=True to force a fresh copy of
     every item regardless.
 
-    make_public=True (the default) uploads with ACL=public-read. This app's whole premise is
-    files a browser fetches directly by URL (every report's links assume that), and a fresh
-    upload otherwise lands with the destination provider's own default ACL — typically private,
-    even when the *source* object was public (an object's ACL is never preserved by a
+    make_public=True (the default) uploads with ACL=public-read. It also reapplies public-read to
+    an already-present object before marking it Skipped, so re-running a report repairs objects
+    left private by an earlier migration without transferring their bytes again. This app's whole
+    premise is files a browser fetches directly by URL (every report's links assume that), and a
+    fresh upload otherwise lands with the destination provider's own default ACL — typically
+    private, even when the *source* object was public (an object's ACL is never preserved by a
     GetObject+PutObject copy the way it would be by a same-provider CopyObject) — which silently
-    breaks every link pointing at it. Set make_public=False to leave the destination's default
-    ACL alone instead. Note this only sets the object's own ACL: a destination bucket with its
-    own "Block Public Access" style setting enabled (a provider console setting, not something
-    this app can see or change) can still keep objects unreachable regardless of their ACL.
+    breaks every link pointing at it. Set make_public=False to leave the destination object's ACL
+    alone instead. Note this only sets the object's own ACL: a destination bucket with its own
+    "Block Public Access" style setting enabled (a provider console setting, not something this
+    app can see or change) can still keep objects unreachable regardless of their ACL.
     on_progress(completed, total, key, success, skipped), when given, fires after each item
     finishes — never optimistically before. on_item_progress(key, bytes_transferred, total_bytes),
     when given, fires *during* an in-progress upload (throttled to roughly once every
@@ -352,6 +354,11 @@ def copy_objects(
                     skipped = False  # not found at the destination (or a transient error) -> copy for real
 
             if skipped:
+                # Existing destination objects may have been created privately by an earlier run.
+                # "Skipped" only means their bytes do not need transferring; it must not bypass
+                # the explicitly requested visibility setting.
+                if make_public:
+                    dst_client.put_object_acl(Bucket=target_bucket, Key=key, ACL="public-read")
                 outcome = {
                     "bucket": bucket, "key": key, "destBucket": target_bucket,
                     "success": True, "skipped": True, "error": None,
