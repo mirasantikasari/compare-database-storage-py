@@ -542,7 +542,7 @@
   let cachedProviders = [];
 
   // Fills any <select> with the same provider list. preselectKey picks a specific option
-  // (e.g. "do" / "wasabi" for the copy section's source/destination) when it's configured,
+  // (e.g. "do-sfo2" / "wasabi" for the copy section's source/destination) when it's configured,
   // falling back to fallbackIndex (by position) when it isn't — so the copy dropdowns start on
   // a sensible DO -> Wasabi guess without forcing it when the deployment uses different keys.
   function populateProviderSelect(select, { preselectKey, fallbackIndex } = {}) {
@@ -570,7 +570,7 @@
       providerSelect.innerHTML = cachedProviders
         .map((p) => `<option value="${p.key}"${p.isDefault ? " selected" : ""}>${p.label}${p.isDefault ? " (default)" : ""}</option>`)
         .join("");
-      populateProviderSelect(document.getElementById("copySourceProvider"), { preselectKey: "do", fallbackIndex: 0 });
+      populateProviderSelect(document.getElementById("copySourceProvider"), { preselectKey: "do-sfo2", fallbackIndex: 0 });
       populateProviderSelect(document.getElementById("copyDestProvider"), { preselectKey: "wasabi", fallbackIndex: cachedProviders.length > 1 ? 1 : 0 });
     } catch (err) {
       providerSelect.innerHTML = `<option value="">Failed to load providers</option>`;

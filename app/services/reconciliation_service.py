@@ -105,7 +105,7 @@ def _split_s3_style_url(pathname: str, host: str) -> tuple[str, str, str | None]
     virtual-hosted setting, the same distinction build_object_url uses — then falls back to AWS's
     well-known *.amazonaws.com pattern even when AWS isn't a configured provider here, since DB
     columns often keep old or foreign references to buckets this app was never given credentials
-    for. provider_hint is that matched provider's key (e.g. "do"), or the literal "aws" for the
+    for. provider_hint is that matched provider's key (e.g. "do-sfo2"), or the literal "aws" for the
     generic-pattern fallback — confident enough to tell "this URL names a *different* provider
     than the one being scanned" apart from "the bucket just isn't in this scan's list", even when
     the bucket name itself happens to coincide (the same tenant bucket name often exists on more
