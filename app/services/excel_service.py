@@ -145,7 +145,12 @@ def generate_storage_report(summary: StorageSummary, file_name: str | None = Non
     return _save_workbook(workbook, file_name)
 
 
-def generate_copy_report(entries: list[dict], dest_provider: str | None, file_name: str | None = None) -> str:
+def generate_copy_report(
+    entries: list[dict],
+    dest_provider: str | None,
+    file_name: str | None = None,
+    on_progress: ReportProgressCallback | None = None,
+) -> str:
     """
     One row per item a /storage/copy(/stream) run was asked to handle, deliverable for "what
     actually got moved to the new provider and where does it live now" — each entry is:
@@ -155,6 +160,12 @@ def generate_copy_report(entries: list[dict], dest_provider: str | None, file_na
     every other report's clickable link is (build_object_url) and is shown even for a Failed row
     (where it points at where the object would be) so a reviewer can immediately tell the two
     providers' copies apart without reconstructing the URL by hand.
+
+    on_progress(phase, written, total, message, extra), when given, fires every
+    _REPORT_TICK_EVERY_ROWS rows plus once more right before the workbook is saved to disk —
+    without it, a report covering a large copy run leaves the UI looking frozen at 100% for
+    however long writing/saving that many rows actually takes, once every item has already
+    finished copying.
     """
     file_name = file_name or build_report_file_name(["copy"])
     workbook = Workbook()
@@ -170,8 +181,10 @@ def generate_copy_report(entries: list[dict], dest_provider: str | None, file_na
     for idx, width in enumerate(widths, start=1):
         sheet.column_dimensions[sheet.cell(row=1, column=idx).column_letter].width = width
 
+    total = len(entries)
+    started_at = time.monotonic()
     status_counts: dict[str, int] = {}
-    for entry in entries:
+    for written, entry in enumerate(entries, start=1):
         status = entry["status"]
         status_counts[status] = status_counts.get(status, 0) + 1
 
@@ -202,6 +215,14 @@ def generate_copy_report(entries: list[dict], dest_provider: str | None, file_na
         if status == "Failed":
             sheet.cell(row=row_idx, column=9).font = _RED
 
+        if on_progress and written % _REPORT_TICK_EVERY_ROWS == 0:
+            elapsed = max(time.monotonic() - started_at, 0.001)
+            on_progress(
+                "report", written, total,
+                f"Writing report — {written:,}/{total:,} row(s) ({written / elapsed:,.0f}/s)",
+                None,
+            )
+
     _style_header_row(sheet)
 
     summary_sheet = workbook.create_sheet("Summary")
@@ -211,6 +232,9 @@ def generate_copy_report(entries: list[dict], dest_provider: str | None, file_na
     _style_header_row(summary_sheet)
     for idx, width in enumerate([16, 10], start=1):
         summary_sheet.column_dimensions[get_column_letter(idx)].width = width
+
+    if on_progress:
+        on_progress("report", total, total, "Saving workbook to disk…", None)
 
     return _save_workbook(workbook, file_name)
 

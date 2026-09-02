@@ -368,6 +368,7 @@
         <label><input type="checkbox" id="copyMakePublic" checked /> make copied files publicly readable (ACL: public-read)</label>
       </div>
       <button id="copyRunBtn" style="align-self:flex-end;">Copy all matched files</button>
+      <button id="copyRetryBtn" style="align-self:flex-end; display:none;">Retry — continue remaining</button>
     </div>
     <div id="copyMsg" class="msg"></div>
     <div id="copyProgressWrap" style="display:none; margin-top:12px;">
@@ -387,7 +388,8 @@
       Upload the completed storage migration report. Only <code>Copied</code>/<code>Skipped</code>
       rows with Table, Column, and Row ID are eligible. Each database value must still exactly
       match Source Path before it is changed to Destination URL; changed rows are reported as
-      conflicts and left untouched. The run is transactional.
+      conflicts and left untouched. Each row commits on its own, so if a large run gets cut off
+      partway, use "Retry — continue remaining" to resume without reapplying already-updated rows.
     </p>
     <div class="row">
       <div>
@@ -407,6 +409,7 @@
         <input type="text" id="dbUpdateConfirm" placeholder="UPDATE URL" size="16" autocomplete="off" />
       </div>
       <button id="dbUpdateRunBtn" style="align-self:flex-end;">Update database URLs</button>
+      <button id="dbUpdateRetryBtn" style="align-self:flex-end; display:none;">Retry — continue remaining</button>
     </div>
     <div id="dbUpdateMsg" class="msg"></div>
     <div id="dbUpdateProgressWrap" style="display:none;">
@@ -523,13 +526,38 @@
     return body;
   }
 
+  // The server (see app/services/sse.py) sends a ": heartbeat" comment at least every 15s
+  // whenever a stream goes quiet, from the event loop itself — independent of whatever the
+  // worker thread is doing — so total silence past a few missed heartbeats means the
+  // connection genuinely died (dropped by a proxy/NAT, laptop sleep, etc.) with no TCP-level
+  // error to catch. Left alone, that hangs `reader.read()` forever with zero feedback. This
+  // races every read against a timer that's reset on any received byte, and aborts the fetch
+  // (turning the hang into a normal thrown error) once it's been quiet for too long.
+  const SSE_IDLE_TIMEOUT_MS = 45000;
+
+  function raceIdleTimeout(promise, controller) {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        controller.abort();
+        reject(new Error(
+          `No response from the server for ${Math.round(SSE_IDLE_TIMEOUT_MS / 1000)}s — the connection appears stuck.`
+        ));
+      }, SSE_IDLE_TIMEOUT_MS);
+      promise.then(
+        (value) => { clearTimeout(timer); resolve(value); },
+        (error) => { clearTimeout(timer); reject(error); },
+      );
+    });
+  }
+
   // Reads a text/event-stream response (GET or POST — native EventSource can't do POST, so
   // this parses SSE frames from a plain fetch body instead) and dispatches each `event: X` /
   // `data: Y` frame to handlers[X](JSON.parse(Y)). Long scans (1TB+, many buckets/tables) can
   // run for minutes; this is what lets the UI show live progress instead of one blocking
   // request that looks hung and may hit a proxy/browser timeout.
   async function fetchSse(url, opts, handlers) {
-    const res = await fetch(url, opts);
+    const controller = new AbortController();
+    const res = await raceIdleTimeout(fetch(url, { ...opts, signal: controller.signal }), controller);
     if (!res.ok || !res.body) {
       const body = await res.json().catch(() => ({}));
       throw new Error(body.message || `Request failed (${res.status})`);
@@ -538,7 +566,7 @@
     const decoder = new TextDecoder();
     let buffer = "";
     while (true) {
-      const { done, value } = await reader.read();
+      const { done, value } = await raceIdleTimeout(reader.read(), controller);
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
       let sep;
@@ -551,7 +579,7 @@
           if (line.startsWith("event:")) event = line.slice(6).trim();
           else if (line.startsWith("data:")) data += line.slice(5).trim();
         }
-        if (!data) continue; // heartbeat comment or empty frame
+        if (!data) continue; // heartbeat comment or empty frame — but still resets the idle timer above
         const parsed = JSON.parse(data);
         if (event === "error") throw new Error(parsed.message || "Stream error");
         handlers[event]?.(parsed);
@@ -953,6 +981,7 @@
   const copyDestProvider = document.getElementById("copyDestProvider");
   const copyDestBucket = document.getElementById("copyDestBucket");
   const copyRunBtn = document.getElementById("copyRunBtn");
+  const copyRetryBtn = document.getElementById("copyRetryBtn");
   const copyProgressWrap = document.getElementById("copyProgressWrap");
   const copyProgressBar = document.getElementById("copyProgressBar");
   const copyProgressLabel = document.getElementById("copyProgressLabel");
@@ -960,6 +989,129 @@
   const copyItemProgressBar = document.getElementById("copyItemProgressBar");
   const copyItemProgressLabel = document.getElementById("copyItemProgressLabel");
   const copyResult = document.getElementById("copyResult");
+
+  // Holds everything needed to resume a copy run that got cut off mid-stream (dropped
+  // connection, browser hiccup, proxy timeout — common with large item counts): the full
+  // item list, the fixed run options, and `remaining` — items not yet confirmed processed.
+  // Cleared once a run finishes cleanly. Lives only in memory, so a page reload still loses
+  // it — but /storage/copy/stream is itself safe to resend in full afterwards, since
+  // overwrite=false skips anything already at the destination.
+  let copyState = null;
+
+  async function runCopyAttempt() {
+    const itemsToSend = copyState.remaining;
+    const total = copyState.allItems.length;
+
+    copyRunBtn.disabled = true;
+    copyRetryBtn.disabled = true;
+    copyRetryBtn.style.display = "none";
+    copyResult.textContent = "";
+    copyResult.className = "msg";
+    copyMsg.textContent = copyState.attempts === 0
+      ? `Copying ${itemsToSend.length} file(s) from "${copyState.fileName}"…`
+      : `Resuming — ${itemsToSend.length} of ${total} file(s) left…`;
+    copyMsg.className = "msg";
+    copyState.attempts += 1;
+
+    const doneAtStart = total - itemsToSend.length;
+    copyProgressWrap.style.display = "block";
+    copyProgressBar.style.width = `${Math.round((doneAtStart / total) * 100)}%`;
+    copyProgressLabel.textContent = `${doneAtStart} / ${total} processed`;
+    copyItemProgressWrap.style.display = "none";
+    copyItemProgressBar.style.width = "0%";
+    copyItemProgressLabel.textContent = "";
+
+    const payload = {
+      items: itemsToSend,
+      sourceProvider: copyState.sourceProvider,
+      destProvider: copyState.destProvider,
+      overwrite: copyState.overwrite,
+      makePublic: copyState.makePublic,
+    };
+    if (copyState.destBucket) payload.destBucket = copyState.destBucket;
+
+    try {
+      await fetchSse(
+        "/storage/copy/stream",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        },
+        {
+          item_progress: (d) => {
+            // Fires repeatedly *during* a single file's upload — without this, a run with only
+            // a handful of large files (or just 1) would leave the bar stuck at 0% the whole
+            // time with no sign anything is happening.
+            copyItemProgressWrap.style.display = "block";
+            copyItemProgressBar.style.width = `${d.percent}%`;
+            copyItemProgressLabel.textContent =
+              `Uploading ${d.key} — ${formatBytes(d.bytesTransferred)} / ${formatBytes(d.totalBytes)} (${d.percent}%)`;
+          },
+          progress: (d) => {
+            // The stream only reports `key` (not bucket), and items finish out of submission
+            // order since the server copies concurrently — so match the first still-pending
+            // item with this key rather than relying on position. Object keys are effectively
+            // unique within one run, so this is enough to track what's actually done.
+            const idx = copyState.remaining.findIndex((it) => it.key === d.key);
+            if (idx !== -1) copyState.remaining.splice(idx, 1);
+
+            const overallDone = total - copyState.remaining.length;
+            const percent = Math.round((overallDone / total) * 100);
+            copyProgressBar.style.width = `${percent}%`;
+            const status = !d.success ? " (failed)" : d.skipped ? " (already at destination, skipped)" : "";
+            copyProgressLabel.textContent = `${overallDone} / ${total} processed (${percent}%) — ${d.key}${status}`;
+            copyItemProgressWrap.style.display = "none";
+          },
+          report_progress: (d) => {
+            // Fires once every file is copied, while the .xlsx report (and, for a large run,
+            // writing it to disk) is being built — without this the bar just sits at 100% with
+            // no sign anything is still happening. Reuses the item-progress bar since it's free
+            // at this point (no more per-file uploads left to show).
+            copyProgressLabel.textContent = `${total} / ${total} processed (100%) — ${d.message}`;
+            copyItemProgressWrap.style.display = "block";
+            copyItemProgressBar.style.width = `${d.percent}%`;
+            copyItemProgressLabel.textContent =
+              `${d.message} — ${d.completed.toLocaleString()} / ${d.total.toLocaleString()} row(s) (${d.percent}%)`;
+          },
+          done: (d) => {
+            copyState.succeededCount += d.succeededCount;
+            copyState.skippedCount += d.skippedCount;
+            copyState.failedCount += d.failedCount;
+            if (d.auditFile) copyState.auditFiles.push(d.auditFile);
+            if (d.reportFile) copyState.reportFiles.push(d.reportFile);
+          },
+        },
+      );
+
+      const { succeededCount, skippedCount, failedCount, auditFiles, reportFiles, destProvider } = copyState;
+      const copiedCount = succeededCount - skippedCount;
+      copyMsg.textContent = "";
+      copyResult.innerHTML =
+        `Copied ${copiedCount} file(s) to ${destProvider}` +
+        `${skippedCount ? `, ${skippedCount} already there (skipped)` : ""}` +
+        `${failedCount ? `, ${failedCount} failed` : ""}. ` +
+        `Audit log${auditFiles.length > 1 ? "s" : ""}: ${auditFiles.join(", ")}` +
+        (reportFiles.length ? ` — ${reportFiles.map(reportLink).join(" ")}` : "");
+      copyResult.className = failedCount ? "msg err" : "msg ok";
+      copyProgressWrap.style.display = "none";
+      copyRetryBtn.style.display = "none";
+      copyState = null;
+    } catch (err) {
+      const remainingCount = copyState.remaining.length;
+      copyMsg.textContent = "";
+      copyResult.textContent = remainingCount > 0
+        ? `Stopped after an error, ${remainingCount} of ${total} file(s) still left: ${err.message}`
+        : err.message;
+      copyResult.className = "msg err";
+      if (remainingCount > 0) {
+        copyRetryBtn.style.display = "inline-block";
+        copyRetryBtn.disabled = false;
+      }
+    } finally {
+      copyRunBtn.disabled = false;
+    }
+  }
 
   // Uploading a report goes straight to copying every "Matched" row it contains — no
   // review-and-tick step in between. Copy never touches the source (see the hint text above),
@@ -971,6 +1123,7 @@
 
     copyResult.textContent = "";
     copyResult.className = "msg";
+    copyRetryBtn.style.display = "none";
 
     if (!file) {
       copyMsg.textContent = "Pick a report file (.xlsx) first.";
@@ -1014,66 +1167,26 @@
       return;
     }
 
-    copyMsg.textContent = `Copying ${items.length} file(s) from "${file.name}"…`;
-    copyProgressWrap.style.display = "block";
-    copyProgressBar.style.width = "0%";
-    copyProgressLabel.textContent = `0 / ${items.length} processed (0%)`;
-    copyItemProgressWrap.style.display = "none";
-    copyItemProgressBar.style.width = "0%";
-    copyItemProgressLabel.textContent = "";
+    copyState = {
+      allItems: items,
+      remaining: items.slice(),
+      fileName: file.name,
+      sourceProvider, destProvider,
+      destBucket: copyDestBucket.value.trim(),
+      overwrite: document.getElementById("copyOverwrite").checked,
+      makePublic: document.getElementById("copyMakePublic").checked,
+      succeededCount: 0, skippedCount: 0, failedCount: 0,
+      auditFiles: [], reportFiles: [],
+      attempts: 0,
+    };
+    await runCopyAttempt();
+  });
 
-    try {
-      const payload = {
-        items, sourceProvider, destProvider,
-        overwrite: document.getElementById("copyOverwrite").checked,
-        makePublic: document.getElementById("copyMakePublic").checked,
-      };
-      const destBucket = copyDestBucket.value.trim();
-      if (destBucket) payload.destBucket = destBucket;
-
-      await fetchSse(
-        "/storage/copy/stream",
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload),
-        },
-        {
-          item_progress: (d) => {
-            // Fires repeatedly *during* a single file's upload — without this, a run with only
-            // a handful of large files (or just 1) would leave the bar stuck at 0% the whole
-            // time with no sign anything is happening.
-            copyItemProgressWrap.style.display = "block";
-            copyItemProgressBar.style.width = `${d.percent}%`;
-            copyItemProgressLabel.textContent =
-              `Uploading ${d.key} — ${formatBytes(d.bytesTransferred)} / ${formatBytes(d.totalBytes)} (${d.percent}%)`;
-          },
-          progress: (d) => {
-            copyProgressBar.style.width = `${d.percent}%`;
-            const status = !d.success ? " (failed)" : d.skipped ? " (already at destination, skipped)" : "";
-            copyProgressLabel.textContent = `${d.completed} / ${d.total} processed (${d.percent}%) — ${d.key}${status}`;
-            copyItemProgressWrap.style.display = "none";
-          },
-          done: (d) => {
-            const { succeededCount, skippedCount, failedCount, auditFile, reportFile } = d;
-            const copiedCount = succeededCount - skippedCount;
-            copyMsg.textContent = "";
-            copyResult.innerHTML =
-              `Copied ${copiedCount} file(s) to ${destProvider}` +
-              `${skippedCount ? `, ${skippedCount} already there (skipped)` : ""}` +
-              `${failedCount ? `, ${failedCount} failed` : ""}. Audit log: ${auditFile}` +
-              (reportFile ? ` — ${reportLink(reportFile)}` : "");
-            copyResult.className = failedCount ? "msg err" : "msg ok";
-          },
-        },
-      );
-    } catch (err) {
-      copyResult.textContent = err.message;
-      copyResult.className = "msg err";
-    } finally {
-      copyProgressWrap.style.display = "none";
-      copyRunBtn.disabled = false;
-    }
+  // Resumes a run that got cut off mid-stream: resends only the items that never got a
+  // progress event back (see copyState.remaining), instead of starting over from item 1.
+  copyRetryBtn.addEventListener("click", async () => {
+    if (!copyState || copyState.remaining.length === 0) return;
+    await runCopyAttempt();
   });
 
   // --- Update database URLs from a completed storage migration report ---
@@ -1083,11 +1196,91 @@
   const dbUpdateManualDatabase = document.getElementById("dbUpdateManualDatabase");
   const dbUpdateConfirm = document.getElementById("dbUpdateConfirm");
   const dbUpdateRunBtn = document.getElementById("dbUpdateRunBtn");
+  const dbUpdateRetryBtn = document.getElementById("dbUpdateRetryBtn");
   const dbUpdateMsg = document.getElementById("dbUpdateMsg");
   const dbUpdateProgressWrap = document.getElementById("dbUpdateProgressWrap");
   const dbUpdateProgressBar = document.getElementById("dbUpdateProgressBar");
   const dbUpdateProgressLabel = document.getElementById("dbUpdateProgressLabel");
   const dbUpdateStats = document.getElementById("dbUpdateStats");
+
+  // Same idea as copyState (see above): what's needed to resume a run cut off mid-stream.
+  // Rows are applied strictly in submission order server-side (one MySQL connection, no
+  // concurrency — see update_migrated_urls), so unlike copy this only needs a count, not
+  // per-item key matching, to know how much of `remaining` is actually done.
+  let dbUpdateState = null;
+
+  async function runDbUpdateAttempt() {
+    const itemsToSend = dbUpdateState.remaining;
+    const total = dbUpdateState.allItems.length;
+
+    dbUpdateRunBtn.disabled = true;
+    dbUpdateRetryBtn.disabled = true;
+    dbUpdateRetryBtn.style.display = "none";
+    dbUpdateMsg.textContent = dbUpdateState.attempts === 0
+      ? `Updating database "${dbUpdateState.database}"…`
+      : `Resuming — ${itemsToSend.length} of ${total} row(s) left…`;
+    dbUpdateMsg.className = "msg";
+    dbUpdateState.attempts += 1;
+
+    const doneAtStart = total - itemsToSend.length;
+    dbUpdateProgressWrap.style.display = "block";
+    dbUpdateProgressBar.style.width = `${Math.round((doneAtStart / total) * 100)}%`;
+    dbUpdateProgressLabel.textContent = `${doneAtStart} / ${total} processed`;
+
+    try {
+      await fetchSse(
+        "/storage/update-database-urls/stream",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            database: dbUpdateState.database, items: itemsToSend, confirm: dbUpdateState.confirm,
+          }),
+        },
+        {
+          progress: (d) => {
+            // d.completed counts rows finished within this attempt, in submission order.
+            dbUpdateState.remaining = itemsToSend.slice(d.completed);
+            const overallDone = total - dbUpdateState.remaining.length;
+            const percent = Math.round((overallDone / total) * 100);
+            dbUpdateProgressBar.style.width = `${percent}%`;
+            dbUpdateProgressLabel.textContent = `${overallDone} / ${total} processed (${percent}%) — ${d.outcome}`;
+          },
+          done: (d) => {
+            dbUpdateState.updated += d.updated;
+            dbUpdateState.alreadyUpdated += d.alreadyUpdated;
+            dbUpdateState.conflict += d.conflict;
+            dbUpdateState.missing += d.missing;
+          },
+        },
+      );
+
+      const { updated, alreadyUpdated, conflict, missing } = dbUpdateState;
+      dbUpdateMsg.textContent = "Database URL update completed.";
+      dbUpdateMsg.className = conflict || missing ? "msg err" : "msg ok";
+      dbUpdateStats.innerHTML = `
+        <div class="stat ok"><div class="n">${updated.toLocaleString()}</div><div class="l">updated</div></div>
+        <div class="stat"><div class="n">${alreadyUpdated.toLocaleString()}</div><div class="l">already updated</div></div>
+        <div class="stat warn"><div class="n">${conflict.toLocaleString()}</div><div class="l">conflicts skipped</div></div>
+        <div class="stat err"><div class="n">${missing.toLocaleString()}</div><div class="l">rows missing</div></div>
+      `;
+      dbUpdateProgressWrap.style.display = "none";
+      dbUpdateRetryBtn.style.display = "none";
+      dbUpdateState = null;
+    } catch (err) {
+      const remainingCount = dbUpdateState.remaining.length;
+      dbUpdateMsg.textContent = remainingCount > 0
+        ? `Stopped after an error, ${remainingCount} of ${total} row(s) still left: ${err.message}`
+        : err.message;
+      dbUpdateMsg.className = "msg err";
+      if (remainingCount > 0) {
+        dbUpdateRetryBtn.style.display = "inline-block";
+        dbUpdateRetryBtn.disabled = false;
+      }
+    } finally {
+      dbUpdateRunBtn.disabled = false;
+    }
+  }
 
   function selectedUpdateDatabase() {
     return dbUpdateDatabase.value === "__manual__"
@@ -1126,6 +1319,7 @@
     dbUpdateMsg.textContent = "";
     dbUpdateMsg.className = "msg";
     dbUpdateStats.innerHTML = "";
+    dbUpdateRetryBtn.style.display = "none";
 
     if (!file) {
       dbUpdateMsg.textContent = "Pick a storage migration report (.xlsx) first.";
@@ -1145,53 +1339,39 @@
 
     dbUpdateRunBtn.disabled = true;
     dbUpdateMsg.textContent = "Validating migration report…";
+    let rows;
     try {
       const formData = new FormData();
       formData.append("file", file);
       const parsed = await fetchJson("/storage/parse-copy-report", { method: "POST", body: formData });
-      const { rows, total, eligible, failed, incomplete } = parsed.data;
+      const { total, eligible, failed, incomplete } = parsed.data;
       if (!eligible) {
         throw new Error(`No eligible rows (${total} total, ${failed} failed, ${incomplete} incomplete).`);
       }
-
-      dbUpdateMsg.textContent =
-        `Validated ${eligible} eligible row(s) from ${total}; updating database "${database}"…`;
-      dbUpdateProgressWrap.style.display = "block";
-      dbUpdateProgressBar.style.width = "0%";
-      dbUpdateProgressLabel.textContent = `0 / ${eligible} processed (0%)`;
-
-      await fetchSse(
-        "/storage/update-database-urls/stream",
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ database, items: rows, confirm: dbUpdateConfirm.value }),
-        },
-        {
-          progress: (d) => {
-            dbUpdateProgressBar.style.width = `${d.percent}%`;
-            dbUpdateProgressLabel.textContent =
-              `${d.completed} / ${d.total} processed (${d.percent}%) — ${d.outcome}`;
-          },
-          done: (d) => {
-            dbUpdateMsg.textContent = "Database URL update completed.";
-            dbUpdateMsg.className = d.conflict || d.missing ? "msg err" : "msg ok";
-            dbUpdateStats.innerHTML = `
-              <div class="stat ok"><div class="n">${d.updated.toLocaleString()}</div><div class="l">updated</div></div>
-              <div class="stat"><div class="n">${d.alreadyUpdated.toLocaleString()}</div><div class="l">already updated</div></div>
-              <div class="stat warn"><div class="n">${d.conflict.toLocaleString()}</div><div class="l">conflicts skipped</div></div>
-              <div class="stat err"><div class="n">${d.missing.toLocaleString()}</div><div class="l">rows missing</div></div>
-            `;
-          },
-        },
-      );
+      rows = parsed.data.rows;
+      dbUpdateMsg.textContent = `Validated ${eligible} eligible row(s) from ${total}.`;
     } catch (err) {
       dbUpdateMsg.textContent = err.message;
       dbUpdateMsg.className = "msg err";
-    } finally {
       dbUpdateRunBtn.disabled = false;
-      dbUpdateProgressWrap.style.display = "none";
+      return;
     }
+
+    dbUpdateState = {
+      allItems: rows,
+      remaining: rows.slice(),
+      database, confirm: dbUpdateConfirm.value,
+      updated: 0, alreadyUpdated: 0, conflict: 0, missing: 0,
+      attempts: 0,
+    };
+    await runDbUpdateAttempt();
+  });
+
+  // Resumes a run that got cut off mid-stream: resends only the rows not yet confirmed
+  // processed (see dbUpdateState.remaining), instead of starting over from row 1.
+  dbUpdateRetryBtn.addEventListener("click", async () => {
+    if (!dbUpdateState || dbUpdateState.remaining.length === 0) return;
+    await runDbUpdateAttempt();
   });
 
   // --- Delete files already migrated (reads back a copy run, deletes from its source provider) ---
