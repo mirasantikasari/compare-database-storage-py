@@ -5,10 +5,44 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+@dataclass
+class ProviderDef:
+    key: str
+    prefix: str
+    label: str
+    # Fixed per-provider region/endpoint, hardcoded here instead of read from .env — these
+    # never change per deployment (Wasabi/DO regions are well-known constants), so only
+    # credentials belong in .env. Leave both None (AWS) to fall back to env-configured values,
+    # since AWS spans many regions a fixed default can't guess.
+    region: str | None = None
+    endpoint: str | None = None
+
+
 PROVIDER_DEFS = [
-    ("aws", "S3_AWS", "AWS S3"),
-    ("wasabi", "S3_WASABI", "Wasabi"),
-    ("do", "S3_DO", "DigitalOcean Spaces"),
+    ProviderDef("aws", "S3_AWS", "AWS S3"),
+    ProviderDef(
+        "wasabi",
+        "S3_WASABI",
+        "Wasabi",
+        region="ap-southeast-1",
+        endpoint="https://s3.ap-southeast-1.wasabisys.com",
+    ),
+    # DigitalOcean Spaces access keys are account-wide, not per-region, so both regions share
+    # the same S3_DO_ACCESS_KEY / S3_DO_SECRET_KEY credential and show up together once it's set.
+    ProviderDef(
+        "do-sfo2",
+        "S3_DO",
+        "DigitalOcean Spaces (SFO2)",
+        region="sfo2",
+        endpoint="https://sfo2.digitaloceanspaces.com",
+    ),
+    ProviderDef(
+        "do-sgp1",
+        "S3_DO",
+        "DigitalOcean Spaces (SGP1)",
+        region="sgp1",
+        endpoint="https://sgp1.digitaloceanspaces.com",
+    ),
 ]
 
 
@@ -23,24 +57,25 @@ class S3ProviderConfig:
     force_path_style: bool
 
 
-def _read_s3_provider(key: str, prefix: str, label: str) -> S3ProviderConfig | None:
+def _read_s3_provider(provider_def: ProviderDef) -> S3ProviderConfig | None:
+    prefix = provider_def.prefix
     access_key_id = os.environ.get(f"{prefix}_ACCESS_KEY")
     secret_access_key = os.environ.get(f"{prefix}_SECRET_KEY")
     if not access_key_id or not secret_access_key:
         return None
 
-    endpoint = os.environ.get(f"{prefix}_ENDPOINT") or None
+    endpoint = provider_def.endpoint or os.environ.get(f"{prefix}_ENDPOINT") or None
     force_path_style_raw = os.environ.get(f"{prefix}_FORCE_PATH_STYLE")
     force_path_style = (
         force_path_style_raw == "true" if force_path_style_raw else bool(endpoint)
     )
 
     return S3ProviderConfig(
-        key=key,
-        label=label,
+        key=provider_def.key,
+        label=provider_def.label,
         access_key_id=access_key_id,
         secret_access_key=secret_access_key,
-        region=os.environ.get(f"{prefix}_REGION") or "us-east-1",
+        region=provider_def.region or os.environ.get(f"{prefix}_REGION") or "us-east-1",
         endpoint=endpoint,
         force_path_style=force_path_style,
     )
@@ -70,10 +105,10 @@ class Env:
 
 def _load_env() -> Env:
     s3_providers: dict[str, S3ProviderConfig] = {}
-    for key, prefix, label in PROVIDER_DEFS:
-        config = _read_s3_provider(key, prefix, label)
+    for provider_def in PROVIDER_DEFS:
+        config = _read_s3_provider(provider_def)
         if config:
-            s3_providers[key] = config
+            s3_providers[provider_def.key] = config
 
     requested_default = os.environ.get("S3_DEFAULT_PROVIDER")
     default_provider_key = (
