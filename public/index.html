@@ -1243,31 +1243,60 @@
     migDeleteResult.textContent = "";
     migDeleteRows = [];
     migDeleteExcluded = 0;
+    migDeleteProgressWrap.style.display = "block";
+    migDeleteProgressBar.style.width = "0%";
+    migDeleteProgressLabel.textContent = "Reading report…";
 
     try {
       const formData = new FormData();
       formData.append("file", file);
-      const { data } = await fetchJson("/storage/parse-copy-delete-report", { method: "POST", body: formData });
+      let data = null;
+      await fetchSse(
+        "/storage/validate-copy-delete-report/stream",
+        { method: "POST", body: formData },
+        {
+          parsed: (d) => {
+            migDeleteMsg.textContent =
+              `Report contains ${d.eligible.toLocaleString()} successful migration row(s). ` +
+              "Checking public destination links…";
+            migDeleteProgressLabel.textContent = `0 / ${d.eligible.toLocaleString()} links checked (0%)`;
+          },
+          progress: (d) => {
+            migDeleteProgressBar.style.width = `${d.percent}%`;
+            migDeleteProgressLabel.textContent =
+              `${d.completed.toLocaleString()} / ${d.total.toLocaleString()} links checked (${d.percent}%)`;
+          },
+          done: (d) => { data = d; },
+        },
+      );
+      if (!data) throw new Error("Destination validation did not return a result.");
+
       migDeleteRows = data.rows;
-      migDeleteExcluded = data.failed + data.incomplete;
+      migDeleteExcluded = data.failed + data.incomplete + data.destinationInvalid;
       renderMigDeleteSummary();
 
       if (migDeleteRows.length === 0) {
         migDeleteMsg.textContent =
-          `No eligible rows (${data.total} total, ${data.failed} failed, ${data.incomplete} incomplete).`;
+          `No safe source files to delete: ${data.reportEligible.toLocaleString()} migrated row(s), ` +
+          `${data.destinationInvalid.toLocaleString()} destination link(s) could not be opened publicly.`;
         migDeleteMsg.className = "msg err";
         return;
       }
 
+      const failures = data.validationFailures || {};
       migDeleteActionRow.style.display = "flex";
       migDeleteMsg.textContent =
-        `Report validated: ${data.eligible.toLocaleString()} of ${data.total.toLocaleString()} rows are eligible. ` +
-        `All eligible files will be deleted after confirmation.`;
-      migDeleteMsg.className = "msg ok";
+        `${data.eligible.toLocaleString()} destination link(s) are publicly readable and safe to continue; ` +
+        `${data.destinationInvalid.toLocaleString()} excluded ` +
+        `(access denied: ${failures.accessDenied || 0}, not found: ${failures.notFound || 0}, ` +
+        `invalid URL: ${failures.invalidUrl || 0}, connection error: ${failures.connectionError || 0}).`;
+      migDeleteMsg.className = data.destinationInvalid ? "msg err" : "msg ok";
       updateMigDeleteState();
     } catch (err) {
       migDeleteMsg.textContent = err.message;
       migDeleteMsg.className = "msg err";
+    } finally {
+      migDeleteProgressWrap.style.display = "none";
     }
   });
 

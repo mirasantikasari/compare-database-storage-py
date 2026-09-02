@@ -31,6 +31,7 @@ from app.services.storage_service import (
     is_region_mismatch_error,
     list_buckets,
     list_objects_page,
+    validate_public_destination_urls,
 )
 from app.types import BucketSummary, StorageSummary
 
@@ -255,6 +256,69 @@ async def parse_copy_delete_report_route(file: UploadFile = File(...)):
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     return {"status": True, "data": {"rows": rows, **stats}}
+
+
+@router.post("/validate-copy-delete-report/stream")
+async def validate_copy_delete_report_stream(file: UploadFile = File(...)):
+    """Parses a migration report and publicly verifies every destination before source deletion."""
+    content = await file.read()
+
+    def work(emit):
+        rows, stats = parse_copy_report_for_delete(io.BytesIO(content))
+        emit("parsed", stats)
+
+        # Emitting every item would create tens of thousands of SSE frames for large reports.
+        # Update at roughly 100 visible steps, plus the final item.
+        tick_every = max(1, len(rows) // 100)
+
+        def on_progress(completed: int, total: int, valid: bool, error: str | None) -> None:
+            if completed == total or completed % tick_every == 0:
+                emit(
+                    "progress",
+                    {
+                        "completed": completed,
+                        "total": total,
+                        "percent": round((completed / total) * 100) if total else 100,
+                        "lastValid": valid,
+                        "lastError": error,
+                    },
+                )
+
+        valid_rows, validation_failures = validate_public_destination_urls(rows, on_progress=on_progress)
+        safe_rows = [
+            {key: row.get(key) for key in ("bucket", "key", "sizeMb", "status")}
+            for row in valid_rows
+        ]
+        failure_counts: dict[str, int] = {}
+        for failure in validation_failures:
+            error = str(failure.get("error") or "Unknown error")
+            if error.startswith("HTTP 403"):
+                category = "accessDenied"
+            elif error.startswith("HTTP 404"):
+                category = "notFound"
+            elif error.startswith("Destination URL"):
+                category = "invalidUrl"
+            else:
+                category = "connectionError"
+            failure_counts[category] = failure_counts.get(category, 0) + 1
+
+        emit(
+            "done",
+            {
+                "rows": safe_rows,
+                **stats,
+                "reportEligible": stats["eligible"],
+                "eligible": len(safe_rows),
+                "destinationInvalid": len(validation_failures),
+                "validationFailures": failure_counts,
+            },
+        )
+
+    return StreamingResponse(
+        sse_stream(work),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+    )
 
 
 class DeleteItem(BaseModel):
