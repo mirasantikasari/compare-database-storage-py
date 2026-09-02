@@ -316,6 +316,7 @@ def parse_copy_report_for_delete(file_obj) -> tuple[list[dict], dict[str, int]]:
             {
                 "bucket": bucket,
                 "key": key,
+                "destinationUrl": destination_url,
                 "sizeMb": cell_value(row, "size (mb)"),
                 "status": status.capitalize(),
             }
