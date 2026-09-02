@@ -3,6 +3,9 @@ import threading
 import time
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlsplit
+from urllib.request import Request, urlopen
 
 from botocore.exceptions import ClientError
 
@@ -143,6 +146,89 @@ _DELETE_BATCH_SIZE = 1000  # S3 DeleteObjects hard limit per request
 # would mean the progress bar jumps straight from 0% to 100% with nothing in between for exactly
 # the runs where watching it matters most. 50 keeps every batch's blast radius small too.
 _DELETE_STREAM_BATCH_SIZE = 50
+
+_PUBLIC_URL_CHECK_CONCURRENCY = 20
+_PUBLIC_URL_CHECK_TIMEOUT_SECONDS = 10
+
+
+def _is_configured_storage_url(url: str) -> bool:
+    """Restricts uploaded report URLs to configured provider hosts (including bucket subdomains)."""
+    parsed = urlsplit(url)
+    if parsed.scheme != "https" or not parsed.hostname:
+        return False
+    hostname = parsed.hostname.lower()
+    for config in env.s3_providers.values():
+        endpoint_host = urlsplit(config.endpoint).hostname if config.endpoint else None
+        if endpoint_host:
+            endpoint_host = endpoint_host.lower()
+            if hostname == endpoint_host or hostname.endswith(f".{endpoint_host}"):
+                return True
+        elif config.key == "aws" and hostname.endswith(".amazonaws.com"):
+            return True
+    return False
+
+
+def validate_public_destination_urls(
+    items: list[dict],
+    concurrency: int = _PUBLIC_URL_CHECK_CONCURRENCY,
+    on_progress: Callable[[int, int, bool, str | None], None] | None = None,
+) -> tuple[list[dict], list[dict]]:
+    """
+    Verifies that each migration destination URL is anonymously readable without downloading it.
+    A one-byte range GET tests the same public path a browser uses while keeping bandwidth tiny.
+    Returns (valid_items, failures), preserving report order in both collections.
+    """
+    outcomes: list[tuple[bool, str | None] | None] = [None] * len(items)
+    completed = 0
+    lock = threading.Lock()
+
+    def check(index: int) -> None:
+        nonlocal completed
+        url = str(items[index].get("destinationUrl") or "")
+        valid = False
+        error: str | None = None
+        if not _is_configured_storage_url(url):
+            error = "Destination URL is not an HTTPS URL for a configured storage provider"
+        else:
+            try:
+                request = Request(
+                    url,
+                    headers={"Range": "bytes=0-0", "User-Agent": "object-storage-reconciler/1.0"},
+                    method="GET",
+                )
+                with urlopen(request, timeout=_PUBLIC_URL_CHECK_TIMEOUT_SECONDS) as response:  # noqa: S310 - host allowlisted above
+                    status = response.status
+                    if status in {200, 206}:
+                        response.read(1)
+                        valid = True
+                    else:
+                        error = f"HTTP {status}"
+            except HTTPError as exc:
+                error = f"HTTP {exc.code}: {exc.reason}"
+            except URLError as exc:
+                error = f"Connection error: {exc.reason}"
+            except (OSError, TimeoutError) as exc:
+                error = f"Connection error: {exc}"
+
+        outcomes[index] = (valid, error)
+        with lock:
+            completed += 1
+            done = completed
+        if on_progress:
+            on_progress(done, len(items), valid, error)
+
+    if items:
+        workers = min(max(1, concurrency), len(items))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            list(pool.map(check, range(len(items))))
+
+    valid_items = [item for item, outcome in zip(items, outcomes) if outcome and outcome[0]]
+    failures = [
+        {"bucket": item.get("bucket"), "key": item.get("key"), "destinationUrl": item.get("destinationUrl"), "error": outcome[1]}
+        for item, outcome in zip(items, outcomes)
+        if outcome and not outcome[0]
+    ]
+    return valid_items, failures
 
 
 def delete_objects(
