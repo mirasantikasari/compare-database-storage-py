@@ -419,38 +419,31 @@
   <section class="card" style="border-color:var(--err);">
     <h2 style="color:var(--err);">Delete files already migrated</h2>
     <p class="hint">
-      Reads back a past copy run's audit trail (<code>reports/.copies/</code>) so the files it
-      successfully copied can be removed from the source provider. Only delete once you've
-      confirmed the app's own database references have actually been repointed at the new
-      provider — this list is not re-verified against the database, it only reflects what the
-      copy step wrote to the destination at the time.
+      Upload a completed storage migration report. Only rows marked <code>Copied</code> or
+      <code>Skipped</code> are included; <code>Failed</code> rows are excluded automatically.
+      Select the source provider carefully, and only delete after confirming the database URLs
+      have been updated. The summary is shown before all eligible source objects are deleted.
+      This does not re-verify the database or destination storage.
     </p>
     <div class="row">
-      <button id="loadCopiesBtn">Load copy history</button>
-      <select id="copiesSelect" style="min-width:360px; display:none;"></select>
+      <div>
+        <label>Storage migration report (.xlsx)</label><br />
+        <input type="file" id="migDeleteFileInput" accept=".xlsx" />
+      </div>
+      <div>
+        <label>Source provider</label><br />
+        <select id="migDeleteSourceProvider"><option value="">Loading…</option></select>
+      </div>
     </div>
     <div id="migDeleteMsg" class="msg"></div>
-    <div id="migDeleteTableWrap" style="display:none; overflow-x:auto;">
-      <table id="migDeleteTable">
-        <thead>
-          <tr>
-            <th><input type="checkbox" id="migDeleteSelectAll" /></th>
-            <th>Bucket</th>
-            <th>Key</th>
-            <th>Copied to</th>
-          </tr>
-        </thead>
-        <tbody id="migDeleteTableBody"></tbody>
-      </table>
-    </div>
-    <div id="migDeleteSummary" class="msg" style="margin-top:12px;"></div>
+    <div id="migDeleteSummary" class="stat-row"></div>
     <div class="row" style="margin-top:12px; display:none;" id="migDeleteActionRow">
       <div>
         <label>Type "HAPUS" to enable delete</label><br />
         <input type="text" id="migDeleteConfirmInput" placeholder="HAPUS" size="16" />
       </div>
       <button class="danger" id="migDeleteRunBtn" style="align-self:flex-end; padding:8px 14px;" disabled>
-        Delete selected from source permanently
+        Delete all eligible files from source permanently
       </button>
     </div>
     <div id="migDeleteProgressWrap" style="display:none; margin-top:12px;">
@@ -607,6 +600,7 @@
         .join("");
       populateProviderSelect(document.getElementById("copySourceProvider"), { preselectKey: "do-sfo2", fallbackIndex: 0 });
       populateProviderSelect(document.getElementById("copyDestProvider"), { preselectKey: "wasabi", fallbackIndex: cachedProviders.length > 1 ? 1 : 0 });
+      populateProviderSelect(document.getElementById("migDeleteSourceProvider"), { preselectKey: "do", fallbackIndex: 0 });
     } catch (err) {
       providerSelect.innerHTML = `<option value="">Failed to load providers</option>`;
     }
@@ -1194,13 +1188,10 @@
     }
   });
 
-  // --- Delete files already migrated (reads back a copy run, deletes from its source provider) ---
-  const loadCopiesBtn = document.getElementById("loadCopiesBtn");
-  const copiesSelect = document.getElementById("copiesSelect");
+  // --- Delete files already migrated (upload a completed migration report) ---
+  const migDeleteFileInput = document.getElementById("migDeleteFileInput");
+  const migDeleteSourceProviderSelect = document.getElementById("migDeleteSourceProvider");
   const migDeleteMsg = document.getElementById("migDeleteMsg");
-  const migDeleteTableWrap = document.getElementById("migDeleteTableWrap");
-  const migDeleteTableBody = document.getElementById("migDeleteTableBody");
-  const migDeleteSelectAll = document.getElementById("migDeleteSelectAll");
   const migDeleteSummary = document.getElementById("migDeleteSummary");
   const migDeleteActionRow = document.getElementById("migDeleteActionRow");
   const migDeleteConfirmInput = document.getElementById("migDeleteConfirmInput");
@@ -1210,91 +1201,68 @@
   const migDeleteProgressLabel = document.getElementById("migDeleteProgressLabel");
   const migDeleteResult = document.getElementById("migDeleteResult");
 
-  let migDeleteRows = []; // {bucket, key, destBucket} — the "succeeded" items from the selected copy run
-  let migDeleteSourceProvider = null;
+  let migDeleteRows = []; // successful report rows: {bucket, key, sizeMb, status}
+  let migDeleteExcluded = 0;
 
-  function checkedMigDeleteBoxes() {
-    return Array.from(migDeleteTableBody.querySelectorAll("input[type=checkbox]"));
+  function renderMigDeleteSummary() {
+    if (!migDeleteRows.length && !migDeleteExcluded) {
+      migDeleteSummary.innerHTML = "";
+      return;
+    }
+    const copied = migDeleteRows.filter((row) => row.status === "Copied").length;
+    const skipped = migDeleteRows.filter((row) => row.status === "Skipped").length;
+    const buckets = new Set(migDeleteRows.map((row) => row.bucket)).size;
+    const totalMb = migDeleteRows.reduce((sum, row) => sum + (parseFloat(row.sizeMb) || 0), 0);
+    migDeleteSummary.innerHTML = `
+      <div class="stat err"><div class="n">${migDeleteRows.length.toLocaleString()}</div><div class="l">eligible to delete</div></div>
+      <div class="stat ok"><div class="n">${copied.toLocaleString()}</div><div class="l">copied</div></div>
+      <div class="stat"><div class="n">${skipped.toLocaleString()}</div><div class="l">skipped / exists</div></div>
+      <div class="stat"><div class="n">${buckets.toLocaleString()}</div><div class="l">source buckets</div></div>
+      <div class="stat"><div class="n">${totalMb.toLocaleString(undefined, { maximumFractionDigits: 2 })}</div><div class="l">total MB</div></div>
+      <div class="stat warn"><div class="n">${migDeleteExcluded.toLocaleString()}</div><div class="l">excluded</div></div>
+    `;
   }
 
   function updateMigDeleteState() {
-    const boxes = checkedMigDeleteBoxes();
-    const checked = boxes.filter((cb) => cb.checked);
-    migDeleteSummary.textContent = checked.length ? `${checked.length} file(s) selected` : "";
-    migDeleteSelectAll.checked = boxes.length > 0 && checked.length === boxes.length;
     const confirmed = migDeleteConfirmInput.value.trim() === DELETE_CONFIRM_PHRASE;
-    migDeleteRunBtn.disabled = !(checked.length > 0 && confirmed);
+    migDeleteRunBtn.disabled = !(migDeleteRows.length > 0 && confirmed && migDeleteSourceProviderSelect.value);
   }
 
   migDeleteConfirmInput.addEventListener("input", updateMigDeleteState);
+  migDeleteSourceProviderSelect.addEventListener("change", updateMigDeleteState);
 
-  loadCopiesBtn.addEventListener("click", async () => {
-    migDeleteMsg.textContent = "Loading…";
-    migDeleteMsg.className = "msg";
-    copiesSelect.style.display = "none";
-    migDeleteTableWrap.style.display = "none";
-    migDeleteActionRow.style.display = "none";
-    migDeleteResult.textContent = "";
-
-    try {
-      const { data } = await fetchJson("/storage/copies");
-      if (!data.copies.length) {
-        migDeleteMsg.textContent = "No copy runs found yet — use \"Copy files to another provider\" above first.";
-        return;
-      }
-      copiesSelect.innerHTML = data.copies
-        .map((c) => `<option value="${c.file}">${c.timestamp ?? c.file} — ${c.sourceProvider} → ${c.destProvider} (${c.succeededCount} succeeded incl. ${c.skippedCount} skipped, ${c.failedCount} failed)</option>`)
-        .join("");
-      copiesSelect.style.display = "inline-block";
-      migDeleteMsg.textContent = `${data.copies.length} copy run(s) found. Pick one to load its successfully-copied files.`;
-      migDeleteMsg.className = "msg ok";
-      copiesSelect.dispatchEvent(new Event("change"));
-    } catch (err) {
-      migDeleteMsg.textContent = err.message;
-      migDeleteMsg.className = "msg err";
-    }
-  });
-
-  copiesSelect.addEventListener("change", async () => {
-    const file = copiesSelect.value;
+  migDeleteFileInput.addEventListener("change", async () => {
+    const file = migDeleteFileInput.files[0];
     if (!file) return;
 
-    migDeleteMsg.textContent = "Loading copy run…";
+    migDeleteMsg.textContent = "Parsing migration report…";
     migDeleteMsg.className = "msg";
-    migDeleteTableWrap.style.display = "none";
-    migDeleteTableBody.innerHTML = "";
+    migDeleteSummary.innerHTML = "";
     migDeleteActionRow.style.display = "none";
     migDeleteConfirmInput.value = "";
     migDeleteResult.textContent = "";
     migDeleteRows = [];
+    migDeleteExcluded = 0;
 
     try {
-      const { data } = await fetchJson(`/storage/copies/${encodeURIComponent(file)}`);
-      migDeleteSourceProvider = data.sourceProvider;
-      migDeleteRows = data.succeeded;
+      const formData = new FormData();
+      formData.append("file", file);
+      const { data } = await fetchJson("/storage/parse-copy-delete-report", { method: "POST", body: formData });
+      migDeleteRows = data.rows;
+      migDeleteExcluded = data.failed + data.incomplete;
+      renderMigDeleteSummary();
 
       if (migDeleteRows.length === 0) {
-        migDeleteMsg.textContent = "This copy run has no successfully-copied files to delete.";
+        migDeleteMsg.textContent =
+          `No eligible rows (${data.total} total, ${data.failed} failed, ${data.incomplete} incomplete).`;
+        migDeleteMsg.className = "msg err";
         return;
       }
 
-      migDeleteRows.forEach((row, i) => {
-        const tr = document.createElement("tr");
-        tr.innerHTML = `
-          <td><input type="checkbox" data-index="${i}" /></td>
-          <td>${row.bucket}</td>
-          <td style="word-break:break-all;">${row.key}</td>
-          <td>${data.destProvider}${row.destBucket ? " / " + row.destBucket : ""}</td>
-        `;
-        tr.querySelector("input[type=checkbox]").addEventListener("change", updateMigDeleteState);
-        migDeleteTableBody.appendChild(tr);
-      });
-
-      migDeleteTableWrap.style.display = "block";
       migDeleteActionRow.style.display = "flex";
       migDeleteMsg.textContent =
-        `${migDeleteRows.length} file(s) copied from ${data.sourceProvider} to ${data.destProvider}. ` +
-        `Only delete these once the database references are confirmed repointed at ${data.destProvider}.`;
+        `Report validated: ${data.eligible.toLocaleString()} of ${data.total.toLocaleString()} rows are eligible. ` +
+        `All eligible files will be deleted after confirmation.`;
       migDeleteMsg.className = "msg ok";
       updateMigDeleteState();
     } catch (err) {
@@ -1303,19 +1271,16 @@
     }
   });
 
-  migDeleteSelectAll.addEventListener("change", () => {
-    checkedMigDeleteBoxes().forEach((cb) => { cb.checked = migDeleteSelectAll.checked; });
-    updateMigDeleteState();
-  });
-
   migDeleteRunBtn.addEventListener("click", async () => {
-    const checked = checkedMigDeleteBoxes().filter((cb) => cb.checked);
-    const items = checked.map((cb) => {
-      const row = migDeleteRows[Number(cb.dataset.index)];
-      return { bucket: row.bucket, key: row.key };
-    });
+    const sourceProvider = migDeleteSourceProviderSelect.value;
+    const items = migDeleteRows.map((row) => ({ bucket: row.bucket, key: row.key }));
 
-    if (!confirm(`Permanently delete ${items.length} file(s) from ${migDeleteSourceProvider}? This cannot be undone.`)) return;
+    if (!sourceProvider) {
+      migDeleteResult.textContent = "Select the source provider first.";
+      migDeleteResult.className = "msg err";
+      return;
+    }
+    if (!confirm(`Permanently delete ${items.length} file(s) from ${sourceProvider}? This cannot be undone.`)) return;
 
     migDeleteRunBtn.disabled = true;
     migDeleteResult.textContent = "";
@@ -1324,7 +1289,7 @@
     migDeleteProgressLabel.textContent = `0 / ${items.length} deleted (0%)`;
 
     try {
-      const payload = { items, confirm: migDeleteConfirmInput.value.trim(), provider: migDeleteSourceProvider };
+      const payload = { items, confirm: migDeleteConfirmInput.value.trim(), provider: sourceProvider };
 
       await fetchSse(
         "/storage/delete/stream",
@@ -1341,15 +1306,11 @@
           done: (d) => {
             const { succeededCount, failedCount, auditFile, results } = d;
             migDeleteResult.textContent =
-              `Deleted ${succeededCount} file(s) from ${migDeleteSourceProvider}${failedCount ? `, ${failedCount} failed` : ""}. Audit log: ${auditFile}`;
+              `Deleted ${succeededCount} file(s) from ${sourceProvider}${failedCount ? `, ${failedCount} failed` : ""}. Audit log: ${auditFile}`;
             migDeleteResult.className = failedCount ? "msg err" : "msg ok";
 
-            results.forEach((r, i) => {
-              if (r.success) checked[i].closest("tr").remove();
-            });
-            migDeleteRows = migDeleteRows.filter(
-              (row) => !results.some((r) => r.success && r.bucket === row.bucket && r.key === row.key)
-            );
+            migDeleteRows = migDeleteRows.filter((_row, index) => !results[index]?.success);
+            renderMigDeleteSummary();
           },
         },
       );

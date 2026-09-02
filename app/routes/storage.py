@@ -16,6 +16,7 @@ from app.services.excel_service import (
     buckets_label,
     generate_copy_report,
     generate_storage_report,
+    parse_copy_report_for_delete,
     parse_copy_report_for_db_update,
     parse_deletable_report,
     parse_matched_report,
@@ -240,6 +241,17 @@ async def parse_copy_report_route(file: UploadFile = File(...)):
     content = await file.read()
     try:
         rows, stats = await asyncio.to_thread(parse_copy_report_for_db_update, io.BytesIO(content))
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    return {"status": True, "data": {"rows": rows, **stats}}
+
+
+@router.post("/parse-copy-delete-report")
+async def parse_copy_delete_report_route(file: UploadFile = File(...)):
+    """Reads successful source objects from an uploaded storage-migration report for review."""
+    content = await file.read()
+    try:
+        rows, stats = await asyncio.to_thread(parse_copy_report_for_delete, io.BytesIO(content))
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     return {"status": True, "data": {"rows": rows, **stats}}
