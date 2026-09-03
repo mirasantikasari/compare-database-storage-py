@@ -216,7 +216,7 @@ All settings are environment variables (see `.env.example` for the full annotate
 |---|---|---|
 | `PORT` | `3000` | |
 | `S3_DEFAULT_PROVIDER` | — | Which provider is used when a request doesn't specify one |
-| `S3_AWS_*` / `S3_WASABI_*` / `S3_DO_*` | — | `_ACCESS_KEY` + `_SECRET_KEY` required for a provider to show up at all |
+| `S3_AWS_*` / `S3_WASABI_*` / `S3_DO_*` | — | `_ACCESS_KEY` + `_SECRET_KEY` required for a provider to show up at all. Only AWS needs `_REGION`/`_ENDPOINT` too — Wasabi and DO's region/endpoint are fixed in `app/config.py` (Wasabi `ap-southeast-1`; DO exposes both `do-sfo2` and `do-sgp1` off the same `S3_DO_*` credential, since DO Spaces keys are account-wide) |
 | `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD` | — | A **read-only** MySQL user is strongly recommended |
 | `DB_DATABASE` | — | Optional fixed default; Auto reconciliation can also target a database per-request |
 | `REPORTS_DIR` | `reports` | Where `.xlsx` reports and `.deletions/*.json` audit logs are written |
