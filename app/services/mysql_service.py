@@ -70,8 +70,15 @@ def update_migrated_urls(
     changed since the report was generated is classified as a conflict and is never overwritten.
     Single-column primary keys are discovered from information_schema; for legacy tables without
     a declared primary key, an `id` column is accepted as the fallback used by reconciliation.
-    The whole run is transactional, so an unexpected database error cannot leave a half-applied
-    report.
+
+    Each row commits on its own (the pooled connection's default autocommit, rather than one
+    transaction wrapping the whole run) so a run that gets interrupted partway — a dropped
+    connection, a huge report — can safely be resumed by resending only the rows that never got
+    a progress event back: this same per-row guard makes reprocessing an already-applied row
+    self-correcting, since its current value will already equal Destination URL and it is simply
+    reported "alreadyUpdated" rather than reapplied or flagged as a conflict. The trade-off is
+    that a run stopped by an unexpected error can leave some rows updated and others not, rather
+    than all-or-nothing.
     """
     _assert_valid_identifier(database, "database")
     if not items:
@@ -119,44 +126,38 @@ def update_migrated_urls(
                     raise ValueError(f'Column "{database}.{table}.{column}" does not exist')
 
         counts = {"updated": 0, "alreadyUpdated": 0, "conflict": 0, "missing": 0, "total": len(items)}
-        conn.begin()
-        try:
-            with conn.cursor() as cursor:
-                for index, item in enumerate(items, start=1):
-                    table = str(item["table"])
-                    column = str(item["column"])
-                    id_column = targets[table][0]
-                    qualified_table = f"{_escape_id(database)}.{_escape_id(table)}"
-                    escaped_column = _escape_id(column)
-                    escaped_id = _escape_id(id_column)
+        with conn.cursor() as cursor:
+            for index, item in enumerate(items, start=1):
+                table = str(item["table"])
+                column = str(item["column"])
+                id_column = targets[table][0]
+                qualified_table = f"{_escape_id(database)}.{_escape_id(table)}"
+                escaped_column = _escape_id(column)
+                escaped_id = _escape_id(id_column)
 
-                    cursor.execute(
-                        f"SELECT {escaped_column} AS currentValue FROM {qualified_table} WHERE {escaped_id} = %s",
-                        [item["rowId"]],
-                    )
-                    row = cursor.fetchone()
-                    if row is None:
-                        outcome = "missing"
+                cursor.execute(
+                    f"SELECT {escaped_column} AS currentValue FROM {qualified_table} WHERE {escaped_id} = %s",
+                    [item["rowId"]],
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    outcome = "missing"
+                else:
+                    current = row["currentValue"]
+                    if current == item["destinationUrl"]:
+                        outcome = "alreadyUpdated"
+                    elif current != item["sourcePath"]:
+                        outcome = "conflict"
                     else:
-                        current = row["currentValue"]
-                        if current == item["destinationUrl"]:
-                            outcome = "alreadyUpdated"
-                        elif current != item["sourcePath"]:
-                            outcome = "conflict"
-                        else:
-                            cursor.execute(
-                                f"UPDATE {qualified_table} SET {escaped_column} = %s "
-                                f"WHERE {escaped_id} = %s AND {escaped_column} = %s",
-                                [item["destinationUrl"], item["rowId"], item["sourcePath"]],
-                            )
-                            outcome = "updated" if cursor.rowcount == 1 else "conflict"
-                    counts[outcome] += 1
-                    if on_progress:
-                        on_progress(index, len(items), outcome)
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
+                        cursor.execute(
+                            f"UPDATE {qualified_table} SET {escaped_column} = %s "
+                            f"WHERE {escaped_id} = %s AND {escaped_column} = %s",
+                            [item["destinationUrl"], item["rowId"], item["sourcePath"]],
+                        )
+                        outcome = "updated" if cursor.rowcount == 1 else "conflict"
+                counts[outcome] += 1
+                if on_progress:
+                    on_progress(index, len(items), outcome)
         return counts
     finally:
         conn.close()

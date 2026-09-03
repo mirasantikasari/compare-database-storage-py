@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 from app.config import env
 from app.providers.s3_provider import list_s3_providers
 from app.services.excel_service import (
+    ReportProgressCallback,
     build_report_file_name,
     buckets_label,
     generate_copy_report,
@@ -550,7 +551,9 @@ def _write_copy_audit_log(
     return os.path.basename(audit_path)
 
 
-def _build_copy_report(body: CopyBody, results: list[dict]) -> str:
+def _build_copy_report(
+    body: CopyBody, results: list[dict], on_progress: ReportProgressCallback | None = None
+) -> str:
     entries = []
     for item, result in zip(body.items, results):
         status = "Failed" if not result["success"] else ("Skipped" if result.get("skipped") else "Copied")
@@ -569,7 +572,8 @@ def _build_copy_report(body: CopyBody, results: list[dict]) -> str:
             }
         )
     return generate_copy_report(
-        entries, body.destProvider, build_report_file_name(["copy", body.sourceProvider, body.destProvider])
+        entries, body.destProvider, build_report_file_name(["copy", body.sourceProvider, body.destProvider]),
+        on_progress=on_progress,
     )
 
 
@@ -654,7 +658,23 @@ async def copy_stream(body: CopyBody):
             items, body.sourceProvider, body.destProvider, body.destBucket, body.overwrite, body.makePublic,
             on_progress=on_progress, on_item_progress=on_item_progress,
         )
-        report_file = _build_copy_report(body, results)
+
+        # Every item is done at this point, but generating the .xlsx (and, for a very large
+        # run, writing it to disk) is not instant — without an explicit signal here, the UI has
+        # nothing to show between the last `progress` event and `done` except a bar stuck at 100%.
+        def on_report_progress(_phase: str, written: int, total: int, message: str, _extra: str | None) -> None:
+            emit(
+                "report_progress",
+                {
+                    "completed": written,
+                    "total": total,
+                    "percent": round((written / total) * 100) if total else 100,
+                    "message": message,
+                },
+            )
+
+        on_report_progress("report", 0, len(results), "Generating Excel report…", None)
+        report_file = _build_copy_report(body, results, on_report_progress)
         audit_file = _write_copy_audit_log(
             body.sourceProvider, body.destProvider, body.destBucket, [i.model_dump() for i in body.items], results, report_file
         )
@@ -682,7 +702,11 @@ async def copy_stream(body: CopyBody):
 
 @router.post("/update-database-urls/stream")
 async def update_database_urls_stream(body: DatabaseUrlUpdateBody):
-    """Repoints DB file URLs from a completed copy report, with guarded transactional updates."""
+    """
+    Repoints DB file URLs from a completed copy report. Every row is guarded (see
+    update_migrated_urls) and commits independently, so a run that gets cut off partway can be
+    resumed by resending only the rows that never got a `progress` event back.
+    """
     if body.confirm != _UPDATE_URL_CONFIRM_PHRASE:
         raise HTTPException(
             status_code=400,
