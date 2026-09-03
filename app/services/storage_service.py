@@ -224,7 +224,7 @@ def validate_public_destination_urls(
 
     valid_items = [item for item, outcome in zip(items, outcomes) if outcome and outcome[0]]
     failures = [
-        {"bucket": item.get("bucket"), "key": item.get("key"), "destinationUrl": item.get("destinationUrl"), "error": outcome[1]}
+        {**item, "error": outcome[1]}
         for item, outcome in zip(items, outcomes)
         if outcome and not outcome[0]
     ]

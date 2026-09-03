@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, File, HTTPException, Query, UploadFile
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.config import env
 from app.providers.s3_provider import list_s3_providers
@@ -15,8 +15,10 @@ from app.services.excel_service import (
     build_report_file_name,
     buckets_label,
     generate_copy_report,
+    generate_deletion_report,
     generate_storage_report,
     parse_copy_report_for_delete,
+    parse_copy_report_for_delete_details,
     parse_copy_report_for_db_update,
     parse_deletable_report,
     parse_matched_report,
@@ -264,7 +266,7 @@ async def validate_copy_delete_report_stream(file: UploadFile = File(...)):
     content = await file.read()
 
     def work(emit):
-        rows, stats = parse_copy_report_for_delete(io.BytesIO(content))
+        rows, stats, report_excluded = parse_copy_report_for_delete_details(io.BytesIO(content))
         emit("parsed", stats)
 
         # Emitting every item would create tens of thousands of SSE frames for large reports.
@@ -285,6 +287,10 @@ async def validate_copy_delete_report_stream(file: UploadFile = File(...)):
                 )
 
         valid_rows, validation_failures = validate_public_destination_urls(rows, on_progress=on_progress)
+        excluded_rows = report_excluded + [
+            {**failure, "status": "Excluded", "reason": failure.get("error")}
+            for failure in validation_failures
+        ]
         safe_rows = [
             {key: row.get(key) for key in ("bucket", "key", "sizeMb", "status")}
             for row in valid_rows
@@ -311,6 +317,7 @@ async def validate_copy_delete_report_stream(file: UploadFile = File(...)):
                 "eligible": len(safe_rows),
                 "destinationInvalid": len(validation_failures),
                 "validationFailures": failure_counts,
+                "excludedRows": excluded_rows,
             },
         )
 
@@ -334,11 +341,17 @@ class DeleteItem(BaseModel):
 
 class DeleteBody(BaseModel):
     items: list[DeleteItem]
+    excluded: list[dict] = Field(default_factory=list)
     provider: str | None = None
     confirm: str
 
 
-def _write_deletion_audit_log(provider: str | None, requested: list[dict], results: list[dict]) -> str:
+def _write_deletion_audit_log(
+    provider: str | None,
+    requested: list[dict],
+    results: list[dict],
+    excluded: list[dict] | None = None,
+) -> str:
     audit_dir = os.path.join(env.reports_dir, ".deletions")
     os.makedirs(audit_dir, exist_ok=True)
     audit_path = os.path.join(audit_dir, f"{datetime.now(timezone.utc):%Y%m%dT%H%M%S}-{uuid.uuid4().hex[:8]}.json")
@@ -349,6 +362,7 @@ def _write_deletion_audit_log(provider: str | None, requested: list[dict], resul
                 "provider": provider,
                 "requested": requested,
                 "results": results,
+                "excluded": excluded or [],
             },
             f,
             indent=2,
@@ -378,7 +392,15 @@ async def delete(body: DeleteBody):
 
     items = [(i.bucket, i.key) for i in body.items]
     results = await asyncio.to_thread(delete_objects, items, body.provider)
-    audit_file = _write_deletion_audit_log(body.provider, [i.model_dump() for i in body.items], results)
+    audit_file = _write_deletion_audit_log(
+        body.provider, [i.model_dump() for i in body.items], results, body.excluded
+    )
+    report_file = await asyncio.to_thread(
+        generate_deletion_report,
+        [i.model_dump() for i in body.items],
+        results,
+        body.excluded,
+    )
 
     succeeded = sum(1 for r in results if r["success"])
     return {
@@ -388,6 +410,7 @@ async def delete(body: DeleteBody):
             "succeededCount": succeeded,
             "failedCount": len(results) - succeeded,
             "auditFile": audit_file,
+            "reportFile": report_file,
         },
     }
 
@@ -419,7 +442,12 @@ async def delete_stream(body: DeleteBody):
         results = delete_objects(
             items, body.provider, batch_size=_DELETE_STREAM_BATCH_SIZE, on_progress=on_progress
         )
-        audit_file = _write_deletion_audit_log(body.provider, [i.model_dump() for i in body.items], results)
+        audit_file = _write_deletion_audit_log(
+            body.provider, [i.model_dump() for i in body.items], results, body.excluded
+        )
+        report_file = generate_deletion_report(
+            [i.model_dump() for i in body.items], results, body.excluded
+        )
 
         succeeded = sum(1 for r in results if r["success"])
         emit(
@@ -429,6 +457,7 @@ async def delete_stream(body: DeleteBody):
                 "succeededCount": succeeded,
                 "failedCount": len(results) - succeeded,
                 "auditFile": audit_file,
+                "reportFile": report_file,
             },
         )
 
