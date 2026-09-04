@@ -1383,6 +1383,7 @@
 
   let migDeleteRows = []; // successful report rows: {bucket, key, sizeMb, status}
   let migDeleteExcluded = 0;
+  let migDeleteExcludedRows = [];
 
   function renderMigDeleteSummary() {
     if (!migDeleteRows.length && !migDeleteExcluded) {
@@ -1423,6 +1424,7 @@
     migDeleteResult.textContent = "";
     migDeleteRows = [];
     migDeleteExcluded = 0;
+    migDeleteExcludedRows = [];
     migDeleteProgressWrap.style.display = "block";
     migDeleteProgressBar.style.width = "0%";
     migDeleteProgressLabel.textContent = "Reading report…";
@@ -1453,6 +1455,7 @@
 
       migDeleteRows = data.rows;
       migDeleteExcluded = data.failed + data.incomplete + data.destinationInvalid;
+      migDeleteExcludedRows = data.excludedRows || [];
       renderMigDeleteSummary();
 
       if (migDeleteRows.length === 0) {
@@ -1482,7 +1485,11 @@
 
   migDeleteRunBtn.addEventListener("click", async () => {
     const sourceProvider = migDeleteSourceProviderSelect.value;
-    const items = migDeleteRows.map((row) => ({ bucket: row.bucket, key: row.key }));
+    const items = migDeleteRows.map((row) => ({
+      bucket: row.bucket,
+      key: row.key,
+      sizeMb: row.sizeMb,
+    }));
 
     if (!sourceProvider) {
       migDeleteResult.textContent = "Select the source provider first.";
@@ -1498,7 +1505,12 @@
     migDeleteProgressLabel.textContent = `0 / ${items.length} deleted (0%)`;
 
     try {
-      const payload = { items, confirm: migDeleteConfirmInput.value.trim(), provider: sourceProvider };
+      const payload = {
+        items,
+        excluded: migDeleteExcludedRows,
+        confirm: migDeleteConfirmInput.value.trim(),
+        provider: sourceProvider,
+      };
 
       await fetchSse(
         "/storage/delete/stream",
@@ -1513,9 +1525,10 @@
             migDeleteProgressLabel.textContent = `${d.completed} / ${d.total} deleted (${d.percent}%) — ${d.bucket}`;
           },
           done: (d) => {
-            const { succeededCount, failedCount, auditFile, results } = d;
-            migDeleteResult.textContent =
-              `Deleted ${succeededCount} file(s) from ${sourceProvider}${failedCount ? `, ${failedCount} failed` : ""}. Audit log: ${auditFile}`;
+            const { succeededCount, failedCount, auditFile, reportFile, results } = d;
+            migDeleteResult.innerHTML =
+              `Deleted ${succeededCount} file(s) from ${sourceProvider}${failedCount ? `, ${failedCount} failed` : ""}. ` +
+              `Audit log: ${auditFile}${reportFile ? ` — ${reportLink(reportFile)}` : ""}`;
             migDeleteResult.className = failedCount ? "msg err" : "msg ok";
 
             migDeleteRows = migDeleteRows.filter((_row, index) => !results[index]?.success);
@@ -1652,9 +1665,10 @@
             deleteProgressLabel.textContent = `${d.completed} / ${d.total} deleted (${d.percent}%) — ${d.bucket}`;
           },
           done: (d) => {
-            const { succeededCount, failedCount, auditFile, results } = d;
-            deleteResult.textContent =
-              `Deleted ${succeededCount} file(s)${failedCount ? `, ${failedCount} failed` : ""}. Audit log: ${auditFile}`;
+            const { succeededCount, failedCount, auditFile, reportFile, results } = d;
+            deleteResult.innerHTML =
+              `Deleted ${succeededCount} file(s)${failedCount ? `, ${failedCount} failed` : ""}. ` +
+              `Audit log: ${auditFile}${reportFile ? ` — ${reportLink(reportFile)}` : ""}`;
             deleteResult.className = failedCount ? "msg err" : "msg ok";
 
             // Drop successfully-deleted rows from the table/model so it reflects what's actually left.

@@ -294,6 +294,12 @@ def parse_copy_report_for_db_update(file_obj) -> tuple[list[dict], dict[str, int
 
 def parse_copy_report_for_delete(file_obj) -> tuple[list[dict], dict[str, int]]:
     """Extracts source objects that successfully reached the destination from a copy report."""
+    results, stats, _excluded = parse_copy_report_for_delete_details(file_obj)
+    return results, stats
+
+
+def parse_copy_report_for_delete_details(file_obj) -> tuple[list[dict], dict[str, int], list[dict]]:
+    """Extracts deletable source objects plus every rejected row and its reason."""
     try:
         workbook = load_workbook(file_obj, read_only=True, data_only=True)
     except Exception as error:  # noqa: BLE001 - openpyxl uses several zip/XML exception types
@@ -306,7 +312,7 @@ def parse_copy_report_for_delete(file_obj) -> tuple[list[dict], dict[str, int]]:
     header = next(rows_iter, None)
     empty_stats = {"total": 0, "eligible": 0, "copied": 0, "skipped": 0, "failed": 0, "incomplete": 0}
     if not header:
-        return [], empty_stats
+        return [], empty_stats, []
 
     col_index = {str(name).strip().lower(): i for i, name in enumerate(header) if name is not None}
     required = ["bucket", "key", "destination url", "status"]
@@ -319,6 +325,7 @@ def parse_copy_report_for_delete(file_obj) -> tuple[list[dict], dict[str, int]]:
         return row[index] if index is not None and index < len(row) else None
 
     results = []
+    excluded = []
     stats = empty_stats.copy()
     for row in rows_iter:
         if not any(value is not None for value in row):
@@ -327,6 +334,15 @@ def parse_copy_report_for_delete(file_obj) -> tuple[list[dict], dict[str, int]]:
         status = str(cell_value(row, "status") or "").strip().lower()
         if status not in {"copied", "skipped"}:
             stats["failed"] += 1
+            excluded.append(
+                {
+                    "bucket": cell_value(row, "bucket"),
+                    "key": cell_value(row, "key"),
+                    "destinationUrl": cell_value(row, "destination url"),
+                    "status": str(cell_value(row, "status") or ""),
+                    "reason": cell_value(row, "error") or "Migration status is not Copied or Skipped",
+                }
+            )
             continue
 
         bucket = cell_value(row, "bucket")
@@ -334,6 +350,20 @@ def parse_copy_report_for_delete(file_obj) -> tuple[list[dict], dict[str, int]]:
         destination_url = cell_value(row, "destination url")
         if not bucket or not key or not destination_url:
             stats["incomplete"] += 1
+            missing = [
+                label
+                for label, value in (("Bucket", bucket), ("Key", key), ("Destination URL", destination_url))
+                if not value
+            ]
+            excluded.append(
+                {
+                    "bucket": bucket,
+                    "key": key,
+                    "destinationUrl": destination_url,
+                    "status": status.capitalize(),
+                    "reason": f"Missing required value(s): {', '.join(missing)}",
+                }
+            )
             continue
 
         results.append(
@@ -347,7 +377,65 @@ def parse_copy_report_for_delete(file_obj) -> tuple[list[dict], dict[str, int]]:
         )
         stats[status] += 1
         stats["eligible"] += 1
-    return results, stats
+    return results, stats, excluded
+
+
+def generate_deletion_report(
+    requested: list[dict],
+    results: list[dict],
+    excluded: list[dict] | None = None,
+    file_name: str | None = None,
+) -> str:
+    """Writes final deletion outcomes and pre-delete exclusions to one workbook."""
+    file_name = file_name or f"deletion-{datetime.now():%Y%m%dT%H%M%S}-{uuid.uuid4().hex[:8]}.xlsx"
+    workbook = Workbook(write_only=True)
+
+    headers = ["Bucket", "Key", "Path", "Size (MB)", "Error"]
+    deleted_sheet = workbook.create_sheet("Deleted")
+    failed_sheet = workbook.create_sheet("Failed")
+    deleted_sheet.append(_header_row(deleted_sheet, headers))
+    failed_sheet.append(_header_row(failed_sheet, headers))
+
+    deleted_count = 0
+    failed_count = 0
+    for index, result in enumerate(results):
+        request = requested[index] if index < len(requested) else {}
+        row = [
+            result.get("bucket") or request.get("bucket") or "",
+            result.get("key") or request.get("key") or "",
+            request.get("path") or "",
+            request.get("sizeMb"),
+            result.get("error") or "",
+        ]
+        if result.get("success"):
+            deleted_sheet.append(row)
+            deleted_count += 1
+        else:
+            failed_sheet.append(row)
+            failed_count += 1
+
+    excluded_rows = excluded or []
+    excluded_sheet = workbook.create_sheet("Excluded")
+    excluded_sheet.append(
+        _header_row(excluded_sheet, ["Bucket", "Key", "Destination URL", "Status", "Reason"])
+    )
+    for item in excluded_rows:
+        excluded_sheet.append(
+            [
+                item.get("bucket") or "",
+                item.get("key") or "",
+                item.get("destinationUrl") or "",
+                item.get("status") or "",
+                item.get("reason") or item.get("error") or "",
+            ]
+        )
+
+    summary = workbook.create_sheet("Summary", 0)
+    summary.append(_header_row(summary, ["Status", "Count"]))
+    summary.append(["Deleted", deleted_count])
+    summary.append(["Failed", failed_count])
+    summary.append(["Excluded", len(excluded_rows)])
+    return _save_workbook(workbook, file_name)
 
 
 def _header_row(ws, headers: list[str]) -> list[WriteOnlyCell]:

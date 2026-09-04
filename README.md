@@ -175,6 +175,9 @@ one of these exists because of a real problem hit while building it:
 - **Full audit trail.** Every delete request, successful or not, is written to
   `reports/.deletions/<timestamp>.json` — what was requested and the exact per-item outcome.
   There is no undo.
+- **Deletion Excel report.** Every completed delete also creates an `.xlsx` report with
+  `Deleted`, `Failed`, and `Excluded` sheets. Migration-report exclusions include the source
+  object and the reason it was not considered safe to delete.
 - **Streamed progress.** `POST /storage/delete/stream` reports progress in batches of 50 (not
   the S3 max of 1000) specifically so a human-reviewed, human-sized selection shows meaningful
   incremental progress instead of jumping straight from 0% to 100%.
