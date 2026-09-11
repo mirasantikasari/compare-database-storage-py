@@ -44,12 +44,37 @@ def get_s3_client(provider_key: str | None = None):
         aws_access_key_id=config.access_key_id,
         aws_secret_access_key=config.secret_access_key,
         config=Config(
+            signature_version="s3v4",
             s3={"addressing_style": "path" if config.force_path_style else "virtual"},
             retries={"max_attempts": 5, "mode": "standard"},
+            max_pool_connections=env.s3_max_pool_connections,
         ),
     )
     _client_cache[key] = client
     return client
+
+
+def build_bucket_url(provider_key: str | None, bucket: str) -> str:
+    """Base URL for a bucket itself (path-style or virtual-hosted, per the provider's config),
+    with no trailing slash — the same addressing rules as build_object_url, minus an object key."""
+    resolved_key = provider_key or env.s3_default_provider_key
+    config = env.s3_providers.get(resolved_key) if resolved_key else None
+
+    if config is None:
+        return bucket
+
+    if config.endpoint:
+        parts = urlsplit(config.endpoint)
+        if config.force_path_style:
+            return f"{parts.scheme}://{parts.netloc}/{bucket}"
+        return f"{parts.scheme}://{bucket}.{parts.netloc}"
+
+    host = (
+        "s3.amazonaws.com"
+        if config.region == "us-east-1"
+        else f"s3.{config.region}.amazonaws.com"
+    )
+    return f"https://{bucket}.{host}"
 
 
 def build_object_url(provider_key: str | None, bucket: str, key: str) -> str:
@@ -73,3 +98,14 @@ def build_object_url(provider_key: str | None, bucket: str, key: str) -> str:
         else f"s3.{config.region}.amazonaws.com"
     )
     return f"https://{bucket}.{host}/{encoded_key}"
+
+
+ARCHIVE_URL_TTL_SECONDS = 7 * 24 * 60 * 60
+
+
+def build_archive_presigned_url(provider_key: str | None, bucket: str, key: str) -> str:
+    """Sign a private archive download for seven days without fetching its contents."""
+    return get_s3_client(provider_key).generate_presigned_url(
+        "get_object", Params={"Bucket": bucket, "Key": key},
+        ExpiresIn=ARCHIVE_URL_TTL_SECONDS, HttpMethod="GET",
+    )

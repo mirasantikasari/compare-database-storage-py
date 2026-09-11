@@ -1,3 +1,5 @@
+import hashlib
+import json
 import re
 import threading
 import time
@@ -10,7 +12,7 @@ from urllib.request import Request, urlopen
 from botocore.exceptions import ClientError
 
 from app.config import env
-from app.providers.s3_provider import get_s3_client
+from app.providers.s3_provider import get_s3_client, build_archive_presigned_url
 from app.types import BucketSummary, ListObjectsPage, StorageObject, StorageSummary
 
 MAX_KEYS_PER_PAGE = 1000
@@ -171,12 +173,19 @@ def _is_configured_storage_url(url: str) -> bool:
 def validate_public_destination_urls(
     items: list[dict],
     concurrency: int = _PUBLIC_URL_CHECK_CONCURRENCY,
-    on_progress: Callable[[int, int, bool, str | None], None] | None = None,
+    on_progress: Callable[[int, int, int, bool, str | None], None] | None = None,
 ) -> tuple[list[dict], list[dict]]:
     """
     Verifies that each migration destination URL is anonymously readable without downloading it.
     A one-byte range GET tests the same public path a browser uses while keeping bandwidth tiny.
     Returns (valid_items, failures), preserving report order in both collections.
+
+    on_progress(index, completed, total, valid, error), when given, fires as each item's own
+    check finishes — checks run concurrently, so completion order does not match `items` order,
+    and `index` (into `items`) is what lets a caller identify exactly which item just finished
+    rather than only how many have finished so far. That, in turn, is what makes a caller-side
+    resume possible: after a dropped connection, only the items whose index was never reported
+    back need to be re-sent, instead of re-checking the whole list from the start.
     """
     outcomes: list[tuple[bool, str | None] | None] = [None] * len(items)
     completed = 0
@@ -215,7 +224,7 @@ def validate_public_destination_urls(
             completed += 1
             done = completed
         if on_progress:
-            on_progress(done, len(items), valid, error)
+            on_progress(index, done, len(items), valid, error)
 
     if items:
         workers = min(max(1, concurrency), len(items))
@@ -231,19 +240,30 @@ def validate_public_destination_urls(
     return valid_items, failures
 
 
+_DELETE_CONCURRENCY = env.storage_delete_concurrency
+
+
 def delete_objects(
     items: list[tuple[str, str]],
     provider: str | None = None,
     batch_size: int = _DELETE_BATCH_SIZE,
-    on_progress: Callable[[int, int, str], None] | None = None,
+    concurrency: int | None = None,
+    on_progress: Callable[[int, int, str, list[dict]], None] | None = None,
 ) -> list[dict]:
     """
     Permanently deletes objects — irreversible, no confirmation or safety check happens here;
     the caller (the /storage/delete route) is where that belongs. Grouped by bucket since
-    DeleteObjects is a per-bucket batch call; returns one result per requested (bucket, key),
-    success or error, in the same order they were given — the caller's audit trail of exactly
-    what happened to each item. on_progress(completed, total, bucket), when given, fires after
-    every batch actually returns from the provider — never optimistically before.
+    DeleteObjects is a per-bucket batch call; batches (possibly several per bucket) run across a
+    bounded thread pool since, like listing, this only ever exchanges metadata — no object bytes
+    flow through the app — so it's safe to parallelize aggressively rather than sending one batch
+    at a time. Returns one result per requested (bucket, key), success or error, in the same order
+    they were given — the caller's audit trail of exactly what happened to each item.
+    on_progress(completed, total, bucket, batch_results), when given, fires after every batch
+    actually returns from the provider — never optimistically before — with batch_results being
+    that batch's own {bucket, key, success, error} outcomes, so a caller can react to (and persist)
+    partial progress as it happens rather than only once the whole request finishes: if the
+    connection drops or the request is retried after a crash, whatever batches already completed
+    don't need to be redone from scratch.
     """
     client = get_s3_client(provider)
 
@@ -251,42 +271,56 @@ def delete_objects(
     for bucket, key in items:
         by_bucket.setdefault(bucket, []).append(key)
 
+    chunks: list[tuple[str, list[str]]] = [
+        (bucket, keys[start : start + batch_size])
+        for bucket, keys in by_bucket.items()
+        for start in range(0, len(keys), batch_size)
+    ]
+
     total = len(items)
     completed = 0
+    lock = threading.Lock()
     outcome_by_item: dict[tuple[str, str], dict] = {}
-    for bucket, keys in by_bucket.items():
-        for start in range(0, len(keys), batch_size):
-            chunk = keys[start : start + batch_size]
-            try:
-                resp = client.delete_objects(
-                    Bucket=bucket,
-                    Delete={"Objects": [{"Key": k} for k in chunk], "Quiet": False},
-                )
-            except Exception as error:  # noqa: BLE001 - one bad batch shouldn't lose the whole request's audit trail
-                message = str(error)
-                for key in chunk:
-                    outcome_by_item[(bucket, key)] = {
-                        "bucket": bucket, "key": key, "success": False, "error": message
-                    }
-                completed += len(chunk)
-                if on_progress:
-                    on_progress(completed, total, bucket)
-                continue
 
-            for deleted in resp.get("Deleted", []):
-                outcome_by_item[(bucket, deleted["Key"])] = {
-                    "bucket": bucket, "key": deleted["Key"], "success": True, "error": None
-                }
-            for err in resp.get("Errors", []):
-                outcome_by_item[(bucket, err["Key"])] = {
+    def delete_chunk(bucket: str, chunk: list[str]) -> None:
+        nonlocal completed
+        try:
+            resp = client.delete_objects(
+                Bucket=bucket,
+                Delete={"Objects": [{"Key": k} for k in chunk], "Quiet": False},
+            )
+        except Exception as error:  # noqa: BLE001 - one bad batch shouldn't lose the whole request's audit trail
+            message = str(error)
+            batch_results = [
+                {"bucket": bucket, "key": key, "success": False, "error": message} for key in chunk
+            ]
+        else:
+            batch_results = [
+                {"bucket": bucket, "key": deleted["Key"], "success": True, "error": None}
+                for deleted in resp.get("Deleted", [])
+            ] + [
+                {
                     "bucket": bucket,
                     "key": err["Key"],
                     "success": False,
                     "error": err.get("Message") or err.get("Code") or "Unknown error",
                 }
+                for err in resp.get("Errors", [])
+            ]
+
+        for result in batch_results:
+            outcome_by_item[(result["bucket"], result["key"])] = result
+
+        with lock:
             completed += len(chunk)
-            if on_progress:
-                on_progress(completed, total, bucket)
+            done = completed
+        if on_progress:
+            on_progress(done, total, bucket, batch_results)
+
+    if chunks:
+        workers = min(concurrency or _DELETE_CONCURRENCY, len(chunks))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            list(pool.map(lambda item: delete_chunk(*item), chunks))
 
     return [
         outcome_by_item.get(
@@ -318,6 +352,15 @@ def _ensure_dest_buckets(dst_client, dest_provider: str, buckets: set[str]) -> d
     actually wrong" from that response alone. CreateBucket's "you already own this" response is
     far more consistent — and on Wasabi specifically, re-creating a bucket already owned by the
     same account is simply a silent no-op, not even an error.
+
+    AWS distinguishes "you already own this" (BucketAlreadyOwnedByYou) from "someone else owns
+    this name" (BucketAlreadyExists), but DigitalOcean Spaces has been observed returning the
+    latter, bare "BucketAlreadyExists", even for a bucket this exact credential already owns — so
+    that code alone can't be trusted to mean "genuine failure" the way it does on AWS. Once
+    CreateBucket says the bucket exists at all (either code), HeadBucket is what actually
+    disambiguates owned-by-this-credential from owned-by-someone-else here: unlike detecting a
+    *missing* bucket, a 200 vs. 403/404 on a bucket that's confirmed to exist is consistent across
+    providers.
     """
     region = None
     config = env.s3_providers.get(dest_provider)
@@ -334,15 +377,38 @@ def _ensure_dest_buckets(dst_client, dest_provider: str, buckets: set[str]) -> d
             results[bucket] = None
         except ClientError as error:
             code = str(error.response.get("Error", {}).get("Code", ""))
-            # Already exists and this credential owns it -> nothing to do, not a real failure.
-            # (BucketAlreadyExists, by contrast, means someone else owns that name — a genuine
-            # failure, left as an error below.)
-            results[bucket] = None if code == "BucketAlreadyOwnedByYou" else str(error)
+            if code == "BucketAlreadyOwnedByYou":
+                results[bucket] = None
+            elif code == "BucketAlreadyExists":
+                try:
+                    dst_client.head_bucket(Bucket=bucket)
+                    results[bucket] = None  # exists and this credential can access it -> owned by us
+                except ClientError:
+                    results[bucket] = str(error)  # exists, but this credential can't reach it -> someone else's
+            else:
+                results[bucket] = str(error)
 
     return results
 
 
 _ITEM_PROGRESS_MIN_INTERVAL = 0.2  # seconds between item_progress callbacks for one file
+
+# Modern buckets (AWS S3 with Object Ownership set to "Bucket owner enforced" — the default for
+# any bucket created since April 2023 — and some S3-compatible providers) reject any PutObject /
+# PutObjectAcl call that carries an ACL at all, rather than just ignoring it. Detected by code
+# where the provider gives one; by message otherwise, since some providers surface this as a
+# generic error code with only the message actually saying ACLs are unsupported.
+_ACL_UNSUPPORTED_CODES = {
+    "UnsupportedAclConfigurationException", "AccessControlListNotSupported", "InvalidBucketAclWithObjectOwnership",
+}
+
+
+def _is_acl_unsupported_error(error: ClientError) -> bool:
+    response_error = error.response.get("Error", {})
+    if str(response_error.get("Code", "")) in _ACL_UNSUPPORTED_CODES:
+        return True
+    message = str(response_error.get("Message", "")).lower()
+    return "acl" in message and any(word in message for word in ("unsupported", "not support", "disabled"))
 
 
 def copy_objects(
@@ -355,6 +421,7 @@ def copy_objects(
     concurrency: int | None = None,
     on_progress: Callable[[int, int, str, bool, bool], None] | None = None,
     on_item_progress: Callable[[str, int, int], None] | None = None,
+    dest_key_fn: Callable[[str, str], str] | None = None,
 ) -> list[dict]:
     """
     Copies objects from one S3-compatible provider to another (e.g. DigitalOcean Spaces ->
@@ -392,6 +459,13 @@ def copy_objects(
     alone instead. Note this only sets the object's own ACL: a destination bucket with its own
     "Block Public Access" style setting enabled (a provider console setting, not something this
     app can see or change) can still keep objects unreachable regardless of their ACL.
+
+    A destination bucket with ACLs disabled entirely (AWS's "Bucket owner enforced" Object
+    Ownership setting, or an equivalent on another provider) rejects any request that carries an
+    ACL at all — so once that's detected for a given target bucket, every subsequent item into
+    that same bucket in this call skips the ACL automatically instead of failing the same way
+    over and over; making it public then falls to that bucket's own policy/settings instead,
+    outside this app's control.
     on_progress(completed, total, key, success, skipped), when given, fires after each item
     finishes — never optimistically before. on_item_progress(key, bytes_transferred, total_bytes),
     when given, fires *during* an in-progress upload (throttled to roughly once every
@@ -399,6 +473,12 @@ def copy_objects(
     file, which for a single large file (or a small selection of them) means no feedback at all
     until it's already done; this is what lets a caller show real "how much longer" progress
     instead of a bar stuck at 0% the entire time.
+
+    dest_key_fn(bucket, key), when given, computes the destination key instead of reusing the
+    source key as-is — e.g. archive_and_delete_objects uses it to file every object under a
+    "<source bucket>/<source key>" path, so objects from different source buckets never collide
+    once dest_bucket points them all at one shared bucket. Every result still reports the
+    (unchanged) source key under "key" plus the resolved destination key under "destKey".
     """
     src_client = get_s3_client(source_provider)
     dst_client = get_s3_client(dest_provider)
@@ -410,17 +490,23 @@ def copy_objects(
     results: list[dict | None] = [None] * total
     completed = 0
     lock = threading.Lock()
+    # Once a target bucket is found to reject ACLs outright, every later item into that same
+    # bucket skips the ACL up front instead of repeating the same failed attempt (see
+    # _is_acl_unsupported_error). Plain dict writes are safe enough here without a lock: worst
+    # case under a race is a handful of redundant retries, never a wrong result.
+    acl_supported: dict[str, bool] = {}
 
     def copy_one(index: int) -> None:
         nonlocal completed
         bucket, key = items[index]
         target_bucket = dest_bucket or bucket
+        target_key = dest_key_fn(bucket, key) if dest_key_fn else key
         skipped = False
 
         bucket_error = bucket_errors.get(target_bucket)
         if bucket_error:
             outcome = {
-                "bucket": bucket, "key": key, "destBucket": target_bucket,
+                "bucket": bucket, "key": key, "destBucket": target_bucket, "destKey": target_key,
                 "success": False, "skipped": False, "error": f"Destination bucket unavailable: {bucket_error}",
             }
             results[index] = outcome
@@ -434,7 +520,7 @@ def copy_objects(
         try:
             if not overwrite:
                 try:
-                    dst_client.head_object(Bucket=target_bucket, Key=key)
+                    dst_client.head_object(Bucket=target_bucket, Key=target_key)
                     skipped = True
                 except ClientError:
                     skipped = False  # not found at the destination (or a transient error) -> copy for real
@@ -443,10 +529,15 @@ def copy_objects(
                 # Existing destination objects may have been created privately by an earlier run.
                 # "Skipped" only means their bytes do not need transferring; it must not bypass
                 # the explicitly requested visibility setting.
-                if make_public:
-                    dst_client.put_object_acl(Bucket=target_bucket, Key=key, ACL="public-read")
+                if make_public and acl_supported.get(target_bucket, True):
+                    try:
+                        dst_client.put_object_acl(Bucket=target_bucket, Key=target_key, ACL="public-read")
+                    except ClientError as acl_error:
+                        if not _is_acl_unsupported_error(acl_error):
+                            raise
+                        acl_supported[target_bucket] = False  # bucket has ACLs disabled entirely -> nothing to reapply
                 outcome = {
-                    "bucket": bucket, "key": key, "destBucket": target_bucket,
+                    "bucket": bucket, "key": key, "destBucket": target_bucket, "destKey": target_key,
                     "success": True, "skipped": True, "error": None,
                 }
             else:
@@ -454,33 +545,48 @@ def copy_objects(
                 extra_args = {}
                 if obj.get("ContentType"):
                     extra_args["ContentType"] = obj["ContentType"]
-                if make_public:
+                if make_public and acl_supported.get(target_bucket, True):
                     extra_args["ACL"] = "public-read"
 
-                callback = None
-                if on_item_progress:
+                def make_callback():
+                    if not on_item_progress:
+                        return None
                     total_bytes = obj.get("ContentLength") or 0
-                    transferred = 0
-                    last_emit = 0.0
+                    state = {"transferred": 0, "last_emit": 0.0}
 
                     def callback(bytes_amount: int) -> None:
-                        nonlocal transferred, last_emit
-                        transferred += bytes_amount
+                        state["transferred"] += bytes_amount
                         now = time.monotonic()
-                        if now - last_emit >= _ITEM_PROGRESS_MIN_INTERVAL or transferred >= total_bytes:
-                            last_emit = now
-                            on_item_progress(key, transferred, total_bytes)
+                        if now - state["last_emit"] >= _ITEM_PROGRESS_MIN_INTERVAL or state["transferred"] >= total_bytes:
+                            state["last_emit"] = now
+                            on_item_progress(key, state["transferred"], total_bytes)
 
-                dst_client.upload_fileobj(
-                    obj["Body"], target_bucket, key, ExtraArgs=extra_args or None, Callback=callback
-                )
+                    return callback
+
+                try:
+                    dst_client.upload_fileobj(
+                        obj["Body"], target_bucket, target_key, ExtraArgs=extra_args or None, Callback=make_callback()
+                    )
+                except ClientError as acl_error:
+                    if "ACL" not in extra_args or not _is_acl_unsupported_error(acl_error):
+                        raise
+                    # The bucket rejects ACLs outright — remember that for the rest of this run,
+                    # then retry this one item without it. The failed attempt may have already
+                    # consumed part of the source stream, so it's re-fetched for a clean retry
+                    # rather than reusing the same (now potentially partial) body.
+                    acl_supported[target_bucket] = False
+                    extra_args.pop("ACL", None)
+                    obj = src_client.get_object(Bucket=bucket, Key=key)
+                    dst_client.upload_fileobj(
+                        obj["Body"], target_bucket, target_key, ExtraArgs=extra_args or None, Callback=make_callback()
+                    )
                 outcome = {
-                    "bucket": bucket, "key": key, "destBucket": target_bucket,
+                    "bucket": bucket, "key": key, "destBucket": target_bucket, "destKey": target_key,
                     "success": True, "skipped": False, "error": None,
                 }
         except Exception as error:  # noqa: BLE001 - one bad object shouldn't abort the whole batch
             outcome = {
-                "bucket": bucket, "key": key, "destBucket": target_bucket,
+                "bucket": bucket, "key": key, "destBucket": target_bucket, "destKey": target_key,
                 "success": False, "skipped": False, "error": str(error),
             }
         results[index] = outcome
@@ -496,3 +602,157 @@ def copy_objects(
             list(pool.map(copy_one, range(total)))
 
     return results
+
+
+def _archive_dest_key(bucket: str, key: str) -> str:
+    return f"{bucket}/{key}"
+
+
+def ensure_public_read_bucket_policy(provider: str, bucket: str) -> str | None:
+    """Ensure anonymous object reads while preserving other bucket policy statements.
+
+    Return a visible error if the provider refuses the public policy.
+    """
+    client = get_s3_client(provider)
+    policy = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Sid": "PublicReadGetObject",
+                "Effect": "Allow",
+                "Principal": "*",
+                "Action": "s3:GetObject",
+                "Resource": f"arn:aws:s3:::{bucket}/*",
+            }
+        ],
+    }
+    try:
+        bucket_error = _ensure_dest_buckets(client, provider, {bucket}).get(bucket)
+        if bucket_error:
+            return bucket_error
+        try:
+            existing = json.loads(client.get_bucket_policy(Bucket=bucket)["Policy"])
+        except ClientError as error:
+            if error.response.get("Error", {}).get("Code") not in {"NoSuchBucketPolicy", "NoSuchPolicy", "404"}:
+                raise
+        else:
+            statements = existing.get("Statement", [])
+            if isinstance(statements, dict):
+                statements = [statements]
+            public_statement = policy["Statement"][0]
+            if public_statement not in statements:
+                # Do not reuse a Sid that belongs to an existing policy statement.
+                public_statement.pop("Sid", None)
+                if public_statement not in statements:
+                    statements.append(public_statement)
+            existing["Statement"] = statements
+            policy = existing
+        client.put_bucket_policy(Bucket=bucket, Policy=json.dumps(policy))
+        return None
+    except ClientError as error:
+        return str(error)
+
+
+def archive_and_delete_objects(
+    items: list[tuple[str, str]],
+    source_provider: str | None,
+    archive_provider: str,
+    archive_bucket: str,
+    concurrency: int | None = None,
+    delete_batch_size: int = _DELETE_BATCH_SIZE,
+    on_copy_progress: Callable[[int, int, str, bool, bool], None] | None = None,
+    on_item_progress: Callable[[str, int, int], None] | None = None,
+    on_delete_progress: Callable[[int, int, str, list[dict]], None] | None = None,
+) -> list[dict]:
+    """Delete sources only after a signed archive download matches their full contents."""
+    if archive_bucket != "scola-school-archives":
+        raise ValueError("Source deletion requires archive bucket scola-school-archives")
+    if any(bucket == archive_bucket for bucket, _ in items):
+        raise ValueError("Archive bucket must never be used as a deletion source")
+    resolved_source = source_provider or env.s3_default_provider_key
+
+    copy_results = copy_objects(
+        items,
+        resolved_source,
+        archive_provider,
+        dest_bucket=archive_bucket,
+        overwrite=False,
+        # Keep transfer outcomes independent from unsupported visibility operations.
+        make_public=False,
+        concurrency=concurrency,
+        on_progress=on_copy_progress,
+        on_item_progress=on_item_progress,
+        dest_key_fn=_archive_dest_key,
+    )
+
+    merged = []
+    for (bucket, key), copy_result in zip(items, copy_results):
+        merged.append(
+            {
+                "bucket": bucket,
+                "key": key,
+                "archiveBucket": copy_result.get("destBucket"),
+                "archiveKey": copy_result.get("destKey"),
+                "copySuccess": copy_result["success"],
+                "copySkipped": copy_result.get("skipped", False),
+                "copyError": copy_result.get("error"),
+                "publicAccessStatus": "Private (presigned URL)",
+                "publicAccessError": None,
+                "deleteAttempted": False,
+                "deleteSuccess": False,
+                "deleteError": None,
+            }
+        )
+    source_client = get_s3_client(resolved_source) if items else None
+    archive_client = get_s3_client(archive_provider) if items else None
+    for index, result in enumerate(merged):
+        result["archiveVerified"] = False
+        result["verificationError"] = None
+        if not result["copySuccess"]:
+            continue
+        bucket, key = result["bucket"], result["key"]
+        try:
+            # Use the expected destination, never a URL supplied by the uploaded report.
+            dest_key = _archive_dest_key(bucket, key)
+            source_meta = source_client.head_object(Bucket=bucket, Key=key)
+            archive_meta = archive_client.head_object(Bucket=archive_bucket, Key=dest_key)
+            if source_meta["ContentLength"] != archive_meta["ContentLength"]:
+                raise ValueError("Archive size differs from source; source retained")
+            source = source_client.get_object(Bucket=bucket, Key=key, IfMatch=source_meta["ETag"])
+            def digest(stream):
+                sha = hashlib.sha256()
+                size = 0
+                while True:
+                    chunk = stream.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    sha.update(chunk)
+                    size += len(chunk)
+                return size, sha.digest()
+            try:
+                source_digest = digest(source["Body"])
+            finally:
+                source["Body"].close()
+            signed_url = build_archive_presigned_url(archive_provider, archive_bucket, dest_key)
+            with urlopen(Request(signed_url), timeout=60) as response:
+                if response.status != 200:
+                    raise ValueError("Archive download did not return HTTP 200")
+                archive_digest = digest(response)
+            if source_digest != archive_digest or source_digest[0] != source_meta["ContentLength"]:
+                raise ValueError("Archive contents differ from source; source retained")
+            current = source_client.head_object(Bucket=bucket, Key=key)
+            if any(current.get(field) != source_meta.get(field) for field in ("ETag", "ContentLength", "LastModified", "VersionId")):
+                raise ValueError("Source changed during verification; source retained")
+            result["archiveVerified"] = True
+        except Exception as error:
+            # Do not persist exception text containing signed URL credentials.
+            result["verificationError"] = f"Archive verification failed ({type(error).__name__}); source retained"
+            continue
+        result["deleteAttempted"] = True
+        outcomes = delete_objects([(bucket, key)], resolved_source, batch_size=1)
+        outcome = outcomes[0]
+        result["deleteSuccess"] = outcome["success"]
+        result["deleteError"] = outcome.get("error")
+        if on_delete_progress:
+            on_delete_progress(index + 1, len(merged), bucket, outcomes)
+    return merged

@@ -4,7 +4,7 @@ import tempfile
 import time
 import uuid
 from collections.abc import Callable
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.cell import WriteOnlyCell
@@ -13,9 +13,9 @@ from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.worksheet import Worksheet
 
 from app.config import env
-from app.providers.s3_provider import build_object_url
+from app.providers.s3_provider import build_object_url, build_archive_presigned_url, ARCHIVE_URL_TTL_SECONDS
 from app.services.reconciliation_service import _split_object_reference
-from app.types import DoCleanupResult, ReconciliationResult, StorageSummary
+from app.types import DoCleanupResult, ReconciliationResult, StorageObject, StorageSummary
 
 _BOLD = Font(bold=True)
 _RED = Font(color="FFCC0000")
@@ -141,6 +141,80 @@ def generate_storage_report(summary: StorageSummary, file_name: str | None = Non
         cell.font = _BOLD
 
     _style_header_row(sheet)
+
+    return _save_workbook(workbook, file_name)
+
+
+def generate_bucket_links_report(links: list[dict], file_name: str | None = None) -> str:
+    """One row per bucket: its name and clickable base URL, for a downloadable list of bucket links."""
+    file_name = file_name or build_report_file_name(["bucket-links"])
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Bucket Links"
+
+    sheet.append(["Bucket", "URL"])
+    for idx, width in enumerate([40, 70], start=1):
+        sheet.column_dimensions[sheet.cell(row=1, column=idx).column_letter].width = width
+
+    for link in links:
+        row_idx = sheet.max_row + 1
+        sheet.append([link["bucket"], link["url"]])
+        cell = sheet.cell(row=row_idx, column=2)
+        cell.hyperlink = link["url"]
+        cell.font = _HYPERLINK_FONT
+
+    _style_header_row(sheet)
+
+    return _save_workbook(workbook, file_name)
+
+
+def generate_bucket_objects_report(
+    bucket: str,
+    objects: list[StorageObject],
+    provider: str | None = None,
+    file_name: str | None = None,
+    on_progress: ReportProgressCallback | None = None,
+) -> str:
+    """
+    Full file listing for one bucket — one row per object actually found in it, each with its
+    key, size, last-modified date, and clickable public URL. write_only mode (see
+    generate_reconciliation_report) since a real bucket can hold anywhere from a handful to
+    millions of objects.
+    """
+    file_name = file_name or build_report_file_name(["bucket-objects", bucket])
+    workbook = Workbook(write_only=True)
+
+    sheet = workbook.create_sheet("Objects")
+    for idx, width in enumerate([60, 14, 22, 70], start=1):
+        sheet.column_dimensions[get_column_letter(idx)].width = width
+    sheet.append(_header_row(sheet, ["Key", "Size (MB)", "Last Modified", "URL"]))
+
+    total = len(objects)
+    total_size = 0
+    started_at = time.monotonic()
+    for written, obj in enumerate(objects, start=1):
+        total_size += obj.size
+        url = build_object_url(provider, bucket, obj.key)
+        sheet.append([obj.key, _mb(obj.size), _naive(obj.last_modified), _hyperlink_cell(sheet, url)])
+
+        if on_progress and written % _REPORT_TICK_EVERY_ROWS == 0:
+            elapsed = max(time.monotonic() - started_at, 0.001)
+            on_progress(
+                "report", written, total,
+                f"Writing report — {written:,}/{total:,} row(s) ({written / elapsed:,.0f}/s)",
+                None,
+            )
+
+    summary_sheet = workbook.create_sheet("Summary")
+    for idx, width in enumerate([20, 30], start=1):
+        summary_sheet.column_dimensions[get_column_letter(idx)].width = width
+    summary_sheet.append(_header_row(summary_sheet, ["Metric", "Value"]))
+    summary_sheet.append(["Bucket", bucket])
+    summary_sheet.append(["Object Count", total])
+    summary_sheet.append(["Total Size", _format_bytes(total_size)])
+
+    if on_progress:
+        on_progress("report", total, total, "Saving workbook to disk…", None)
 
     return _save_workbook(workbook, file_name)
 
@@ -292,12 +366,6 @@ def parse_copy_report_for_db_update(file_obj) -> tuple[list[dict], dict[str, int
     return results, stats
 
 
-def parse_copy_report_for_delete(file_obj) -> tuple[list[dict], dict[str, int]]:
-    """Extracts source objects that successfully reached the destination from a copy report."""
-    results, stats, _excluded = parse_copy_report_for_delete_details(file_obj)
-    return results, stats
-
-
 def parse_copy_report_for_delete_details(file_obj) -> tuple[list[dict], dict[str, int], list[dict]]:
     """Extracts deletable source objects plus every rejected row and its reason."""
     try:
@@ -380,39 +448,84 @@ def parse_copy_report_for_delete_details(file_obj) -> tuple[list[dict], dict[str
     return results, stats, excluded
 
 
-def generate_deletion_report(
+def generate_archive_deletion_report(
     requested: list[dict],
     results: list[dict],
     excluded: list[dict] | None = None,
+    archive_provider: str | None = None,
     file_name: str | None = None,
 ) -> str:
-    """Writes final deletion outcomes and pre-delete exclusions to one workbook."""
-    file_name = file_name or f"deletion-{datetime.now():%Y%m%dT%H%M%S}-{uuid.uuid4().hex[:8]}.xlsx"
+    """Write archive copy outcomes and links; source files are retained."""
+    file_name = file_name or f"archive-deletion-{datetime.now():%Y%m%dT%H%M%S}-{uuid.uuid4().hex[:8]}.xlsx"
     workbook = Workbook(write_only=True)
 
-    headers = ["Bucket", "Key", "Path", "Size (MB)", "Error"]
-    deleted_sheet = workbook.create_sheet("Deleted")
-    failed_sheet = workbook.create_sheet("Failed")
-    deleted_sheet.append(_header_row(deleted_sheet, headers))
-    failed_sheet.append(_header_row(failed_sheet, headers))
+    headers = [
+        "Bucket", "Key", "Path", "Size (MB)", "Archive URL",
+        "Copy Status", "Copy Error", "Delete Status", "Delete Error",
+        "Public Access Status", "Public Access Error", "Archive URL Expires At (UTC)", "Archive URL Error", "Archive Verified", "Verification Error",
+    ]
+    widths = [20, 45, 55, 12, 55, 12, 30, 14, 30, 30, 65, 30, 60, 20, 65]
+    archived_deleted_sheet = workbook.create_sheet("Archived & Deleted")
+    archived_not_deleted_sheet = workbook.create_sheet("Archived, Not Deleted")
+    copy_failed_sheet = workbook.create_sheet("Copy Failed (Not Deleted)")
+    for sheet in (archived_deleted_sheet, archived_not_deleted_sheet, copy_failed_sheet):
+        sheet.append(_header_row(sheet, headers))
+        for idx, width in enumerate(widths, start=1):
+            sheet.column_dimensions[get_column_letter(idx)].width = width
 
-    deleted_count = 0
-    failed_count = 0
+    counts = {"Archived & Deleted": 0, "Archived, Not Deleted": 0, "Copy Failed (Not Deleted)": 0}
     for index, result in enumerate(results):
         request = requested[index] if index < len(requested) else {}
-        row = [
-            result.get("bucket") or request.get("bucket") or "",
-            result.get("key") or request.get("key") or "",
-            request.get("path") or "",
-            request.get("sizeMb"),
-            result.get("error") or "",
-        ]
-        if result.get("success"):
-            deleted_sheet.append(row)
-            deleted_count += 1
+        bucket = result.get("bucket") or request.get("bucket") or ""
+        key = result.get("key") or request.get("key") or ""
+        copy_ok = bool(result.get("copySuccess"))
+        delete_ok = bool(result.get("deleteSuccess"))
+
+        if copy_ok and delete_ok:
+            target_sheet = archived_deleted_sheet
+            counts["Archived & Deleted"] += 1
+        elif copy_ok:
+            target_sheet = archived_not_deleted_sheet
+            counts["Archived, Not Deleted"] += 1
         else:
-            failed_sheet.append(row)
-            failed_count += 1
+            target_sheet = copy_failed_sheet
+            counts["Copy Failed (Not Deleted)"] += 1
+
+        archive_url = None
+        archive_expiry = ""
+        archive_url_error = ""
+        if copy_ok and result.get("archiveBucket") and result.get("archiveKey"):
+            try:
+                issued_at = datetime.now(timezone.utc)
+                archive_url = build_archive_presigned_url(
+                    archive_provider, result["archiveBucket"], result["archiveKey"]
+                )
+                archive_expiry = (issued_at + timedelta(seconds=ARCHIVE_URL_TTL_SECONDS)).isoformat()
+            except Exception as error:
+                archive_url_error = str(error)
+        delete_status = (
+            "Deleted" if delete_ok else ("Not attempted" if not result.get("deleteAttempted") else "Failed")
+        )
+
+        target_sheet.append(
+            [
+                bucket,
+                key,
+                request.get("path") or "",
+                request.get("sizeMb"),
+                _hyperlink_cell(target_sheet, archive_url) if archive_url else "",
+                ("Already archived" if result.get("copySkipped") else "Copied") if copy_ok else "Failed",
+                result.get("copyError") or "",
+                delete_status,
+                result.get("deleteError") or "",
+                result.get("publicAccessStatus") or "Not verified",
+                result.get("publicAccessError") or "",
+                archive_expiry,
+                archive_url_error,
+                "Yes" if result.get("archiveVerified") else "No",
+                result.get("verificationError") or "",
+            ]
+        )
 
     excluded_rows = excluded or []
     excluded_sheet = workbook.create_sheet("Excluded")
@@ -432,9 +545,10 @@ def generate_deletion_report(
 
     summary = workbook.create_sheet("Summary", 0)
     summary.append(_header_row(summary, ["Status", "Count"]))
-    summary.append(["Deleted", deleted_count])
-    summary.append(["Failed", failed_count])
+    for label, count in counts.items():
+        summary.append([label, count])
     summary.append(["Excluded", len(excluded_rows)])
+    summary.append(["Archive links", "Presigned GET URLs valid for 7 days. Regenerate report after expiry. Anyone with the link can download until expiry."])
     return _save_workbook(workbook, file_name)
 
 
@@ -760,6 +874,65 @@ def parse_deletable_report(file_obj) -> list[dict]:
             }
         )
     return results
+
+
+_DELETION_EXCLUDED_SHEET_NAME = "Excluded"
+
+
+def parse_deletion_excluded_report(file_obj) -> tuple[list[dict], list[dict]]:
+    """
+    Reads the "Excluded" sheet of a previously-downloaded deletion report (see
+    generate_deletion_report) back in, for retrying exclusions caused by something transient —
+    most commonly a connection timeout while checking whether the destination URL was publicly
+    readable, which can easily pass on a second try even though nothing about the file changed.
+
+    Returns (candidates, unretryable): candidates have a bucket, key, and destination URL and can
+    be re-checked; unretryable rows are missing one of those (nothing left to re-check) and are
+    passed through unchanged so they stay visible as still-excluded rather than silently dropped.
+    """
+    try:
+        workbook = load_workbook(file_obj, read_only=True, data_only=True)
+    except Exception as error:  # noqa: BLE001 - openpyxl raises its own zip/XML errors for anything not a real .xlsx
+        raise ValueError(f"Not a valid .xlsx file: {error}") from error
+
+    if _DELETION_EXCLUDED_SHEET_NAME not in workbook.sheetnames:
+        raise ValueError(
+            f"No '{_DELETION_EXCLUDED_SHEET_NAME}' sheet found in the uploaded file — upload a "
+            "deletion report downloaded from this app's own delete flow."
+        )
+    ws = workbook[_DELETION_EXCLUDED_SHEET_NAME]
+
+    rows_iter = ws.iter_rows(values_only=True)
+    header = next(rows_iter, None)
+    if not header:
+        return [], []
+    col_index = {str(name).strip().lower(): i for i, name in enumerate(header) if name is not None}
+    required = ["bucket", "key", "destination url"]
+    missing = [name for name in required if name not in col_index]
+    if missing:
+        raise ValueError(f"'{_DELETION_EXCLUDED_SHEET_NAME}' sheet is missing expected column(s): {', '.join(missing)}")
+
+    def cell_value(row, column_name: str):
+        index = col_index.get(column_name)
+        return row[index] if index is not None and index < len(row) else None
+
+    candidates = []
+    unretryable = []
+    for row in rows_iter:
+        if not any(value is not None for value in row):
+            continue
+        item = {
+            "bucket": cell_value(row, "bucket"),
+            "key": cell_value(row, "key"),
+            "destinationUrl": cell_value(row, "destination url"),
+            "status": cell_value(row, "status") or "Excluded",
+            "reason": cell_value(row, "reason"),
+        }
+        if item["bucket"] and item["key"] and item["destinationUrl"]:
+            candidates.append(item)
+        else:
+            unretryable.append(item)
+    return candidates, unretryable
 
 
 _MATCHED_SHEET_NAME = "Matched"

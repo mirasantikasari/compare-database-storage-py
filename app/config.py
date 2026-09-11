@@ -99,8 +99,12 @@ class Env:
     reports_dir: str
     storage_summary_concurrency: int
     storage_copy_concurrency: int
+    storage_delete_concurrency: int
     db_scan_concurrency: int
     max_content_scan_table_rows: int
+    s3_max_pool_connections: int
+    archive_bucket: str
+    archive_provider: str
 
 
 def _load_env() -> Env:
@@ -135,6 +139,10 @@ def _load_env() -> Env:
         # PUT to destination) — too much parallel data transfer can saturate the app's own network
         # link rather than either provider, so this defaults lower.
         storage_copy_concurrency=int(os.environ.get("STORAGE_COPY_CONCURRENCY", "4")),
+        # Like storage_summary_concurrency: DeleteObjects is a metadata-only call (no bytes
+        # streamed through the app), so it's safe to parallelize aggressively rather than the
+        # conservative default copy_objects uses for full-content transfers.
+        storage_delete_concurrency=int(os.environ.get("STORAGE_DELETE_CONCURRENCY", "8")),
         # Deliberately separate from storage_summary_concurrency (which only ever calls out to
         # S3-compatible APIs — safe to parallelize aggressively). This one bounds how many
         # simultaneous full-column table scans hit the *production* MySQL server at once, so it
@@ -147,6 +155,18 @@ def _load_env() -> Env:
         # schema, and the least valuable to scan for embedded file references (they're historical
         # snapshots, not the live content columns that actually need protecting).
         max_content_scan_table_rows=int(os.environ.get("MAX_CONTENT_SCAN_TABLE_ROWS", "50000")),
+        # Each provider gets one cached, shared boto3 client (see get_s3_client), so this bounds
+        # total simultaneous sockets to that provider across every feature at once (summary scan,
+        # reconciliation, and cross-provider copy can all be in flight together). botocore/urllib3
+        # default to just 10, which is well below storage_summary_concurrency's own default of 8
+        # once more than one feature runs concurrently, so connections get discarded and re-opened
+        # under load instead of reused.
+        s3_max_pool_connections=int(os.environ.get("S3_MAX_POOL_CONNECTIONS", "50")),
+        # "Delete files from report" no longer deletes outright: every object is first copied here
+        # (under a "<original bucket>/<original key>" path, so objects from different buckets never
+        # collide once they share this one archive bucket). Original files are deleted only after signed-download verification. Defaults match the account this was set up for.
+        archive_bucket=os.environ.get("ARCHIVE_S3_BUCKET", "scola-school-archives"),
+        archive_provider=os.environ.get("ARCHIVE_S3_PROVIDER", "do-sgp1"),
     )
 
 

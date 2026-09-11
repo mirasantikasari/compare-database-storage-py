@@ -10,33 +10,37 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from app.config import env
-from app.providers.s3_provider import list_s3_providers
+from app.providers.s3_provider import build_bucket_url, list_s3_providers
 from app.services.excel_service import (
     ReportProgressCallback,
     build_report_file_name,
     buckets_label,
+    generate_archive_deletion_report,
+    generate_bucket_links_report,
+    generate_bucket_objects_report,
     generate_copy_report,
-    generate_deletion_report,
     generate_storage_report,
-    parse_copy_report_for_delete,
     parse_copy_report_for_delete_details,
     parse_copy_report_for_db_update,
     parse_deletable_report,
+    parse_deletion_excluded_report,
     parse_matched_report,
 )
 from app.services.mysql_service import list_databases, update_migrated_urls
 from app.services.sse import sse_stream
 from app.services.storage_service import (
     _DELETE_STREAM_BATCH_SIZE,
+    archive_and_delete_objects,
     copy_objects,
-    delete_objects,
+    ensure_public_read_bucket_policy,
     get_storage_summary,
     is_region_mismatch_error,
+    iterate_bucket_objects,
     list_buckets,
     list_objects_page,
     validate_public_destination_urls,
 )
-from app.types import BucketSummary, StorageSummary
+from app.types import BucketSummary, StorageObject, StorageSummary
 
 router = APIRouter(prefix="/storage")
 
@@ -65,9 +69,20 @@ async def get_databases():
 
 
 @router.get("/buckets")
-async def get_buckets(provider: str | None = Query(default=None)):
+async def get_buckets(provider: str | None = Query(default=None), export: str | None = Query(default=None)):
     buckets = await asyncio.to_thread(list_buckets, provider)
-    return {"status": True, "data": {"buckets": buckets, "count": len(buckets)}}
+    links = [{"bucket": b, "url": build_bucket_url(provider, b)} for b in buckets]
+
+    report_file = None
+    if export == "true":
+        report_file = await asyncio.to_thread(
+            generate_bucket_links_report, links, build_report_file_name(["bucket-links", provider])
+        )
+
+    return {
+        "status": True,
+        "data": {"buckets": buckets, "links": links, "count": len(buckets), "reportFile": report_file},
+    }
 
 
 @router.get("/summary")
@@ -206,6 +221,49 @@ async def get_objects(
     }
 
 
+@router.get("/{bucket}/objects/export/stream")
+async def export_bucket_objects_stream(
+    bucket: str,
+    prefix: str | None = Query(default=None),
+    provider: str | None = Query(default=None),
+):
+    """
+    Lists every object in one bucket and writes it to a downloadable .xlsx — Key, Size, Last
+    Modified, and a clickable public URL per row. Streamed via SSE, same as every other
+    potentially-slow scan in this app: a bucket can hold anywhere from a handful of objects to
+    millions, so the scan itself reports progress before the report-writing phase gets a chance to.
+    """
+
+    def work(emit):
+        objects: list[StorageObject] = []
+        for obj in iterate_bucket_objects(bucket, prefix, provider):
+            objects.append(obj)
+            if len(objects) % 500 == 0:
+                emit("progress", {"phase": "scan", "scanned": len(objects)})
+
+        def on_report_progress(_phase: str, written: int, total: int, message: str, _extra: str | None) -> None:
+            emit(
+                "progress",
+                {
+                    "phase": "report",
+                    "scanned": len(objects),
+                    "completed": written,
+                    "total": total,
+                    "percent": round((written / total) * 100) if total else 100,
+                    "message": message,
+                },
+            )
+
+        report_file = generate_bucket_objects_report(bucket, objects, provider, on_progress=on_report_progress)
+        emit("done", {"bucket": bucket, "count": len(objects), "reportFile": report_file})
+
+    return StreamingResponse(
+        sse_stream(work),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+    )
+
+
 @router.post("/parse-report")
 async def parse_report(file: UploadFile = File(...)):
     """
@@ -252,29 +310,147 @@ async def parse_copy_report_route(file: UploadFile = File(...)):
 
 @router.post("/parse-copy-delete-report")
 async def parse_copy_delete_report_route(file: UploadFile = File(...)):
-    """Reads successful source objects from an uploaded storage-migration report for review."""
+    """
+    Reads a storage-migration report's Copied sheet back in — the fast, network-free half of
+    "Delete files already migrated", split out from the public-URL check (see
+    /validate-destination-urls/stream) specifically so a slow or dropped link check never means
+    re-uploading and re-parsing the file too: the client keeps this response around and only
+    resends whichever candidate rows the link check hasn't confirmed yet.
+    """
     content = await file.read()
     try:
-        rows, stats = await asyncio.to_thread(parse_copy_report_for_delete, io.BytesIO(content))
+        rows, stats, excluded = await asyncio.to_thread(parse_copy_report_for_delete_details, io.BytesIO(content))
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
-    return {"status": True, "data": {"rows": rows, **stats}}
+    return {"status": True, "data": {"rows": rows, "excluded": excluded, **stats}}
 
 
-@router.post("/validate-copy-delete-report/stream")
-async def validate_copy_delete_report_stream(file: UploadFile = File(...)):
-    """Parses a migration report and publicly verifies every destination before source deletion."""
+def _categorize_validation_failure(error: str | None) -> str:
+    error = str(error or "Unknown error")
+    if error.startswith("HTTP 403"):
+        return "accessDenied"
+    if error.startswith("HTTP 404"):
+        return "notFound"
+    if error.startswith("Destination URL"):
+        return "invalidUrl"
+    return "connectionError"
+
+
+class ValidateUrlItem(BaseModel):
+    bucket: str
+    key: str
+    destinationUrl: str
+    sizeMb: str | float | int | None = None
+    status: str | None = None
+
+
+class ValidateUrlsBody(BaseModel):
+    items: list[ValidateUrlItem]
+
+
+@router.post("/validate-destination-urls/stream")
+async def validate_destination_urls_stream(body: ValidateUrlsBody):
+    """
+    Publicly verifies that every given destination URL is still readable — the slow,
+    network-dependent half of "Delete files already migrated". Deliberately takes the candidate
+    rows directly (rather than re-parsing an uploaded file) so a dropped connection partway
+    through a large batch can be retried by resending only the items whose outcome never made it
+    back to the client, instead of starting the whole check over from row one.
+
+    Progress events carry each just-finished item's own (bucket, key, valid) outcome, batched
+    rather than one per item (a report with tens of thousands of rows would otherwise mean tens
+    of thousands of SSE frames) — but still fine-grained enough that a client can track exactly
+    which items are confirmed done and compute "everything not yet accounted for" as the retry set.
+    """
+    items = [i.model_dump() for i in body.items]
+
+    def work(emit):
+        if not items:
+            emit(
+                "done",
+                {"rows": [], "excludedRows": [], "eligible": 0, "destinationInvalid": 0, "validationFailures": {}},
+            )
+            return
+
+        # Emitting every item would create tens of thousands of SSE frames for large reports.
+        # Batch item outcomes and flush at roughly 100-200 visible steps, plus the final item —
+        # frequent enough that a dropped connection loses at most a small, cheap-to-redo batch.
+        tick_every = max(1, len(items) // 150)
+        pending_results: list[dict] = []
+
+        def on_progress(index: int, completed: int, total: int, valid: bool, error: str | None) -> None:
+            pending_results.append(
+                {"bucket": items[index]["bucket"], "key": items[index]["key"], "valid": valid, "error": error}
+            )
+            if completed == total or completed % tick_every == 0:
+                emit(
+                    "progress",
+                    {
+                        "completed": completed,
+                        "total": total,
+                        "percent": round((completed / total) * 100) if total else 100,
+                        "results": pending_results,
+                    },
+                )
+                pending_results.clear()
+
+        valid_rows, validation_failures = validate_public_destination_urls(items, on_progress=on_progress)
+        excluded_rows = [
+            {**failure, "status": "Excluded", "reason": failure.get("error")}
+            for failure in validation_failures
+        ]
+        safe_rows = [
+            {key: row.get(key) for key in ("bucket", "key", "sizeMb", "status")}
+            for row in valid_rows
+        ]
+        failure_counts: dict[str, int] = {}
+        for failure in validation_failures:
+            category = _categorize_validation_failure(failure.get("error"))
+            failure_counts[category] = failure_counts.get(category, 0) + 1
+
+        emit(
+            "done",
+            {
+                "rows": safe_rows,
+                "eligible": len(safe_rows),
+                "destinationInvalid": len(validation_failures),
+                "validationFailures": failure_counts,
+                "excludedRows": excluded_rows,
+            },
+        )
+
+    return StreamingResponse(
+        sse_stream(work),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+    )
+
+
+@router.post("/validate-deletion-excluded-report/stream")
+async def validate_deletion_excluded_report_stream(file: UploadFile = File(...)):
+    """
+    Re-checks the "Excluded" sheet of a deletion report this app generated earlier: many
+    exclusions there are transient (a connection timeout while checking the destination URL was
+    publicly readable, not the file being genuinely unsafe to delete), so a later retry can turn
+    out fine even though nothing about the file itself changed. Same public-URL check and
+    eligible/excluded split as /validate-destination-urls/stream, just sourced from a deletion
+    report's Excluded sheet instead of a migration report's Copied sheet.
+    """
     content = await file.read()
 
     def work(emit):
-        rows, stats, report_excluded = parse_copy_report_for_delete_details(io.BytesIO(content))
-        emit("parsed", stats)
+        candidates, unretryable = parse_deletion_excluded_report(io.BytesIO(content))
+        total = len(candidates) + len(unretryable)
+        emit(
+            "parsed",
+            {"total": total, "eligible": len(candidates), "unretryable": len(unretryable)},
+        )
 
         # Emitting every item would create tens of thousands of SSE frames for large reports.
         # Update at roughly 100 visible steps, plus the final item.
-        tick_every = max(1, len(rows) // 100)
+        tick_every = max(1, len(candidates) // 100)
 
-        def on_progress(completed: int, total: int, valid: bool, error: str | None) -> None:
+        def on_progress(_index: int, completed: int, total: int, valid: bool, error: str | None) -> None:
             if completed == total or completed % tick_every == 0:
                 emit(
                     "progress",
@@ -287,36 +463,26 @@ async def validate_copy_delete_report_stream(file: UploadFile = File(...)):
                     },
                 )
 
-        valid_rows, validation_failures = validate_public_destination_urls(rows, on_progress=on_progress)
-        excluded_rows = report_excluded + [
+        valid_rows, validation_failures = validate_public_destination_urls(candidates, on_progress=on_progress)
+        excluded_rows = unretryable + [
             {**failure, "status": "Excluded", "reason": failure.get("error")}
             for failure in validation_failures
         ]
         safe_rows = [
-            {key: row.get(key) for key in ("bucket", "key", "sizeMb", "status")}
+            {key: row.get(key) for key in ("bucket", "key", "status")}
             for row in valid_rows
         ]
         failure_counts: dict[str, int] = {}
         for failure in validation_failures:
-            error = str(failure.get("error") or "Unknown error")
-            if error.startswith("HTTP 403"):
-                category = "accessDenied"
-            elif error.startswith("HTTP 404"):
-                category = "notFound"
-            elif error.startswith("Destination URL"):
-                category = "invalidUrl"
-            else:
-                category = "connectionError"
+            category = _categorize_validation_failure(failure.get("error"))
             failure_counts[category] = failure_counts.get(category, 0) + 1
 
         emit(
             "done",
             {
                 "rows": safe_rows,
-                **stats,
-                "reportEligible": stats["eligible"],
                 "eligible": len(safe_rows),
-                "destinationInvalid": len(validation_failures),
+                "stillExcluded": len(excluded_rows),
                 "validationFailures": failure_counts,
                 "excludedRows": excluded_rows,
             },
@@ -361,6 +527,8 @@ def _write_deletion_audit_log(
             {
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "provider": provider,
+                "archiveProvider": env.archive_provider,
+                "archiveBucket": env.archive_bucket,
                 "requested": requested,
                 "results": results,
                 "excluded": excluded or [],
@@ -380,85 +548,113 @@ def _validate_delete_body(body: DeleteBody) -> None:
         )
 
 
+def _archive_deletion_counts(results: list[dict]) -> dict:
+    deleted = sum(1 for r in results if r["deleteSuccess"])
+    copy_failed = sum(1 for r in results if not r["copySuccess"])
+    archived_not_deleted = sum(1 for r in results if r["copySuccess"] and not r["deleteSuccess"])
+    return {
+        "deletedCount": deleted,
+        "copyFailedCount": copy_failed,
+        "archivedNotDeletedCount": archived_not_deleted,
+        "publicAccessWarningCount": sum(1 for r in results if r.get("publicAccessError")),
+    }
+
+
 @router.post("/delete")
 async def delete(body: DeleteBody):
-    """
-    Permanently deletes the given objects. Irreversible, so this refuses to run unless `confirm`
-    is the exact phrase the UI makes a human type out by hand first — a request built by hand or
-    replayed from a saved payload without that phrase gets rejected before anything is deleted.
-    Every successful attempt is written to reports/.deletions/ as an audit trail, since there is
-    no undo for whatever this deletes.
-    """
+    """Archive report objects and delete sources only after signed-download verification."""
     _validate_delete_body(body)
 
+    # Best-effort: the archive bucket may have ACLs disabled entirely (see
+    # ensure_public_read_bucket_policy), in which case a bucket policy is the only way its objects
+    # can be made publicly readable at all. Never blocks archiving on failure — a policy
+    # that can't be set just means the report's archive links may not resolve until it's fixed.
+    policy_error = None  # Private archives use signed links; no public policy needed.
+
     items = [(i.bucket, i.key) for i in body.items]
-    results = await asyncio.to_thread(delete_objects, items, body.provider)
+    results = await asyncio.to_thread(
+        archive_and_delete_objects, items, body.provider, env.archive_provider, env.archive_bucket
+    )
     audit_file = _write_deletion_audit_log(
         body.provider, [i.model_dump() for i in body.items], results, body.excluded
     )
     report_file = await asyncio.to_thread(
-        generate_deletion_report,
+        generate_archive_deletion_report,
         [i.model_dump() for i in body.items],
         results,
         body.excluded,
+        env.archive_provider,
     )
 
-    succeeded = sum(1 for r in results if r["success"])
     return {
         "status": True,
         "data": {
             "results": results,
-            "succeededCount": succeeded,
-            "failedCount": len(results) - succeeded,
+            **_archive_deletion_counts(results),
             "auditFile": audit_file,
             "reportFile": report_file,
+            "archiveBucketPolicyError": policy_error,
         },
     }
 
 
 @router.post("/delete/stream")
 async def delete_stream(body: DeleteBody):
-    """
-    Same permanent-delete-with-confirmation as POST /delete, but reports progress as it goes
-    (batches of _DELETE_STREAM_BATCH_SIZE, not the whole request in one blocking call) — for
-    watching a larger selection get deleted without the UI just sitting there with no feedback
-    until it's entirely done. Same audit trail as the non-streaming endpoint.
-    """
+    """Stream archiving and deletion after signed-download verification."""
     _validate_delete_body(body)
 
     def work(emit):
         items = [(i.bucket, i.key) for i in body.items]
+        total = len(items)
 
-        def on_progress(completed: int, total: int, bucket: str) -> None:
+        def on_copy_progress(completed: int, total_: int, key: str, success: bool, skipped: bool) -> None:
             emit(
-                "progress",
+                "copy_progress",
                 {
                     "completed": completed,
-                    "total": total,
-                    "percent": round((completed / total) * 100) if total else 100,
-                    "bucket": bucket,
+                    "total": total_,
+                    "percent": round((completed / total_) * 100) if total_ else 100,
+                    "key": key,
+                    "success": success,
+                    "skipped": skipped,
                 },
             )
 
-        results = delete_objects(
-            items, body.provider, batch_size=_DELETE_STREAM_BATCH_SIZE, on_progress=on_progress
+        def on_delete_progress(completed: int, total_: int, bucket: str, batch_results: list[dict]) -> None:
+            emit(
+                "delete_progress",
+                {
+                    "completed": completed,
+                    "total": total_,
+                    "percent": round((completed / total_) * 100) if total_ else 100,
+                    "bucket": bucket,
+                    "results": batch_results,
+                },
+            )
+
+        # Best-effort: see the matching comment in POST /delete. Never blocks archiving.
+        policy_error = None  # Private archives use signed links.
+
+        results = archive_and_delete_objects(
+            items, body.provider, env.archive_provider, env.archive_bucket,
+            delete_batch_size=_DELETE_STREAM_BATCH_SIZE,
+            on_copy_progress=on_copy_progress, on_delete_progress=on_delete_progress,
         )
         audit_file = _write_deletion_audit_log(
             body.provider, [i.model_dump() for i in body.items], results, body.excluded
         )
-        report_file = generate_deletion_report(
-            [i.model_dump() for i in body.items], results, body.excluded
+        report_file = generate_archive_deletion_report(
+            [i.model_dump() for i in body.items], results, body.excluded, env.archive_provider,
         )
 
-        succeeded = sum(1 for r in results if r["success"])
         emit(
             "done",
             {
                 "results": results,
-                "succeededCount": succeeded,
-                "failedCount": len(results) - succeeded,
+                **_archive_deletion_counts(results),
                 "auditFile": audit_file,
                 "reportFile": report_file,
+                "archiveBucketPolicyError": policy_error,
             },
         )
 

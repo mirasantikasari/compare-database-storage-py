@@ -192,10 +192,38 @@
 
   <section class="card">
     <h2>Buckets</h2>
-    <p class="hint">Buckets visible to the configured credential.</p>
-    <button id="loadBuckets">Load buckets</button>
+    <p class="hint">Buckets visible to the configured credential, with each bucket's base URL.</p>
+    <div class="row">
+      <button id="loadBuckets">Load buckets</button>
+      <div style="align-self:center;">
+        <label><input type="checkbox" id="bucketsExport" /> also save .xlsx report</label>
+      </div>
+    </div>
     <div id="bucketList" class="bucket-list" style="margin-top:12px;"></div>
     <div id="bucketMsg" class="msg"></div>
+    <div id="bucketReport"></div>
+  </section>
+
+  <section class="card">
+    <h2>Bucket contents</h2>
+    <p class="hint">Type a bucket name to list every file inside it into a downloadable .xlsx (Key, Size, Last Modified, URL).</p>
+    <div class="row">
+      <div>
+        <label>Bucket name</label><br />
+        <input type="text" id="bucketContentsName" placeholder="scola-mtsjuara" size="24" />
+      </div>
+      <div>
+        <label>Prefix (optional)</label><br />
+        <input type="text" id="bucketContentsPrefix" placeholder="images/" size="20" />
+      </div>
+      <button id="exportBucketContents" style="align-self:flex-end;">Export to Excel</button>
+    </div>
+    <div id="bucketContentsMsg" class="msg"></div>
+    <div id="bucketContentsProgressWrap" style="display:none;">
+      <div class="progress-track"><div id="bucketContentsProgressBar" class="progress-fill"></div></div>
+      <div id="bucketContentsProgressLabel" class="loading"></div>
+    </div>
+    <div id="bucketContentsReport"></div>
   </section>
 
   <section class="card">
@@ -439,6 +467,9 @@
       </div>
     </div>
     <div id="migDeleteMsg" class="msg"></div>
+    <button id="migDeleteContinueBtn" style="display:none; margin-top:8px;">
+      Continue checking remaining links
+    </button>
     <div id="migDeleteSummary" class="stat-row"></div>
     <div class="row" style="margin-top:12px; display:none;" id="migDeleteActionRow">
       <div>
@@ -457,40 +488,70 @@
   </section>
 
   <section class="card" style="border-color:var(--err);">
+    <h2 style="color:var(--err);">Delete previously excluded files</h2>
+    <p class="hint">
+      Upload a deletion report this app generated earlier. Reads its <code>Excluded</code> sheet
+      and re-checks each destination link — many exclusions there are transient (a connection
+      timeout while checking the link, not the file being genuinely unsafe) and can turn out fine
+      on a retry. Rows still excluded (permanently invalid, or missing bucket/key/URL entirely)
+      stay excluded.
+    </p>
+    <div class="row">
+      <div>
+        <label>Deletion report (.xlsx)</label><br />
+        <input type="file" id="excludedDeleteFileInput" accept=".xlsx" />
+      </div>
+      <div>
+        <label>Source provider</label><br />
+        <select id="excludedDeleteSourceProvider"><option value="">Loading…</option></select>
+      </div>
+    </div>
+    <div id="excludedDeleteMsg" class="msg"></div>
+    <div id="excludedDeleteSummary" class="stat-row"></div>
+    <div class="row" style="margin-top:12px; display:none;" id="excludedDeleteActionRow">
+      <div>
+        <label>Type "HAPUS" to enable delete</label><br />
+        <input type="text" id="excludedDeleteConfirmInput" placeholder="HAPUS" size="16" />
+      </div>
+      <button class="danger" id="excludedDeleteRunBtn" style="align-self:flex-end; padding:8px 14px;" disabled>
+        Delete all eligible files from source permanently
+      </button>
+    </div>
+    <div id="excludedDeleteProgressWrap" style="display:none; margin-top:12px;">
+      <div class="progress-track"><div id="excludedDeleteProgressBar" class="progress-fill" style="background:var(--err);"></div></div>
+      <div id="excludedDeleteProgressLabel" class="loading"></div>
+    </div>
+    <div id="excludedDeleteResult" class="msg" style="margin-top:12px;"></div>
+  </section>
+
+  <section class="card" style="border-color:var(--err);">
     <h2 style="color:var(--err);">Delete files from report</h2>
     <p class="hint">
-      Upload an Orphan or Cleanup Candidates report you already downloaded and reviewed. Nothing
-      is deleted until you tick the rows you want gone and type the confirmation phrase — this
-      is permanent and cannot be undone by this tool.
+      Upload an Orphan or Cleanup Candidates report you already downloaded and reviewed. Every row
+      in the file is processed — there's no per-row selection step. Nothing happens until you type
+      the confirmation phrase. Each file is first archived to the <code>scola-school-archives</code>
+      bucket (under a folder named after its original bucket), with private presigned download links.
+      Source files are deleted only after the signed archive download matches the complete source contents. Failed checks retain the source. The resulting report contains archive links and copy failures.
     </p>
     <div class="row">
       <div>
         <label>Report file (.xlsx)</label><br />
         <input type="file" id="deleteFileInput" accept=".xlsx" />
       </div>
+      <div>
+        <label>Source provider</label><br />
+        <select id="deleteSourceProvider"><option value="">Loading…</option></select>
+      </div>
     </div>
     <div id="deleteMsg" class="msg"></div>
-    <div id="deleteTableWrap" style="display:none; overflow-x:auto;">
-      <table id="deleteTable">
-        <thead>
-          <tr>
-            <th><input type="checkbox" id="deleteSelectAll" /></th>
-            <th>Path</th>
-            <th>Size (MB)</th>
-            <th>Last Modified</th>
-          </tr>
-        </thead>
-        <tbody id="deleteTableBody"></tbody>
-      </table>
-    </div>
     <div id="deleteSummary" class="msg" style="margin-top:12px;"></div>
     <div class="row" style="margin-top:12px; display:none;" id="deleteActionRow">
       <div>
-        <label>Type "HAPUS" to enable delete</label><br />
+        <label>Type "HAPUS" to enable archive (verified originals deleted)</label><br />
         <input type="text" id="deleteConfirmInput" placeholder="HAPUS" size="16" />
       </div>
       <button class="danger" id="deleteRunBtn" style="align-self:flex-end; padding:8px 14px;" disabled>
-        Delete selected permanently
+        Archive, verify &amp; delete
       </button>
     </div>
     <div id="deleteProgressWrap" style="display:none; margin-top:12px;">
@@ -629,6 +690,8 @@
       populateProviderSelect(document.getElementById("copySourceProvider"), { preselectKey: "do-sfo2", fallbackIndex: 0 });
       populateProviderSelect(document.getElementById("copyDestProvider"), { preselectKey: "wasabi", fallbackIndex: cachedProviders.length > 1 ? 1 : 0 });
       populateProviderSelect(document.getElementById("migDeleteSourceProvider"), { preselectKey: "do", fallbackIndex: 0 });
+      populateProviderSelect(document.getElementById("excludedDeleteSourceProvider"), { preselectKey: "do", fallbackIndex: 0 });
+      populateProviderSelect(document.getElementById("deleteSourceProvider"), { preselectKey: "do", fallbackIndex: 0 });
     } catch (err) {
       providerSelect.innerHTML = `<option value="">Failed to load providers</option>`;
     }
@@ -639,23 +702,89 @@
   const loadBucketsBtn = document.getElementById("loadBuckets");
   const bucketList = document.getElementById("bucketList");
   const bucketMsg = document.getElementById("bucketMsg");
+  const bucketReport = document.getElementById("bucketReport");
+  const bucketsExport = document.getElementById("bucketsExport");
 
   loadBucketsBtn.addEventListener("click", async () => {
     bucketMsg.textContent = "Loading…";
     bucketMsg.className = "msg";
     bucketList.innerHTML = "";
+    bucketReport.innerHTML = "";
     try {
       const bucketParams = new URLSearchParams();
       if (selectedProvider()) bucketParams.set("provider", selectedProvider());
+      if (bucketsExport.checked) bucketParams.set("export", "true");
       const { data } = await fetchJson(`/storage/buckets?${bucketParams.toString()}`);
       bucketMsg.textContent = `${data.count} bucket(s)`;
       bucketMsg.className = "msg ok";
       bucketList.innerHTML = data.buckets
         .map((b) => `<span class="bucket-chip">${b}</span>`)
         .join("");
+      bucketReport.innerHTML = reportLink(data.reportFile);
     } catch (err) {
       bucketMsg.textContent = err.message;
       bucketMsg.className = "msg err";
+    }
+  });
+
+  // --- Bucket contents ---
+  const exportBucketContentsBtn = document.getElementById("exportBucketContents");
+  const bucketContentsMsg = document.getElementById("bucketContentsMsg");
+  const bucketContentsProgressWrap = document.getElementById("bucketContentsProgressWrap");
+  const bucketContentsProgressBar = document.getElementById("bucketContentsProgressBar");
+  const bucketContentsProgressLabel = document.getElementById("bucketContentsProgressLabel");
+  const bucketContentsReport = document.getElementById("bucketContentsReport");
+
+  exportBucketContentsBtn.addEventListener("click", async () => {
+    const bucket = document.getElementById("bucketContentsName").value.trim();
+    const prefix = document.getElementById("bucketContentsPrefix").value.trim();
+
+    if (!bucket) {
+      bucketContentsMsg.textContent = "Bucket name is required.";
+      bucketContentsMsg.className = "msg err";
+      return;
+    }
+
+    const params = new URLSearchParams();
+    if (prefix) params.set("prefix", prefix);
+    if (selectedProvider()) params.set("provider", selectedProvider());
+
+    bucketContentsMsg.textContent = "Scanning…";
+    bucketContentsMsg.className = "msg";
+    bucketContentsProgressWrap.style.display = "block";
+    bucketContentsProgressBar.style.width = "0%";
+    bucketContentsProgressLabel.textContent = "";
+    bucketContentsReport.innerHTML = "";
+    exportBucketContentsBtn.disabled = true;
+
+    try {
+      await fetchSse(
+        `/storage/${encodeURIComponent(bucket)}/objects/export/stream?${params.toString()}`,
+        {},
+        {
+          progress: (d) => {
+            if (d.phase === "scan") {
+              bucketContentsMsg.textContent = `Scanning… ${d.scanned.toLocaleString()} object(s) found so far`;
+            } else {
+              bucketContentsMsg.textContent = "";
+              bucketContentsProgressBar.style.width = `${d.percent}%`;
+              bucketContentsProgressLabel.textContent = `${d.message} (${d.percent}%)`;
+            }
+          },
+          done: (d) => {
+            bucketContentsMsg.textContent = `${d.count.toLocaleString()} object(s) in "${d.bucket}"`;
+            bucketContentsMsg.className = "msg ok";
+            bucketContentsProgressBar.style.width = "100%";
+            bucketContentsProgressLabel.textContent = "";
+            bucketContentsReport.innerHTML = reportLink(d.reportFile);
+          },
+        },
+      );
+    } catch (err) {
+      bucketContentsMsg.textContent = err.message;
+      bucketContentsMsg.className = "msg err";
+    } finally {
+      exportBucketContentsBtn.disabled = false;
     }
   });
 
@@ -1372,6 +1501,7 @@
   const migDeleteFileInput = document.getElementById("migDeleteFileInput");
   const migDeleteSourceProviderSelect = document.getElementById("migDeleteSourceProvider");
   const migDeleteMsg = document.getElementById("migDeleteMsg");
+  const migDeleteContinueBtn = document.getElementById("migDeleteContinueBtn");
   const migDeleteSummary = document.getElementById("migDeleteSummary");
   const migDeleteActionRow = document.getElementById("migDeleteActionRow");
   const migDeleteConfirmInput = document.getElementById("migDeleteConfirmInput");
@@ -1381,12 +1511,15 @@
   const migDeleteProgressLabel = document.getElementById("migDeleteProgressLabel");
   const migDeleteResult = document.getElementById("migDeleteResult");
 
-  let migDeleteRows = []; // successful report rows: {bucket, key, sizeMb, status}
-  let migDeleteExcluded = 0;
-  let migDeleteExcludedRows = [];
+  let migDeleteRows = []; // rows confirmed publicly reachable so far: {bucket, key, sizeMb, status}
+  let migDeleteExcludedRows = []; // rows confirmed excluded so far (permanent or transient failure)
+
+  // Survives across a dropped/failed link-check request, so "Continue" can resend only what
+  // was never confirmed one way or the other instead of re-parsing and re-checking everything.
+  let migDeleteCheckState = null; // { remaining, checkedCount, totalCount }
 
   function renderMigDeleteSummary() {
-    if (!migDeleteRows.length && !migDeleteExcluded) {
+    if (!migDeleteRows.length && !migDeleteExcludedRows.length) {
       migDeleteSummary.innerHTML = "";
       return;
     }
@@ -1400,7 +1533,7 @@
       <div class="stat"><div class="n">${skipped.toLocaleString()}</div><div class="l">skipped / exists</div></div>
       <div class="stat"><div class="n">${buckets.toLocaleString()}</div><div class="l">source buckets</div></div>
       <div class="stat"><div class="n">${totalMb.toLocaleString(undefined, { maximumFractionDigits: 2 })}</div><div class="l">total MB</div></div>
-      <div class="stat warn"><div class="n">${migDeleteExcluded.toLocaleString()}</div><div class="l">excluded</div></div>
+      <div class="stat warn"><div class="n">${migDeleteExcludedRows.length.toLocaleString()}</div><div class="l">excluded</div></div>
     `;
   }
 
@@ -1412,74 +1545,126 @@
   migDeleteConfirmInput.addEventListener("input", updateMigDeleteState);
   migDeleteSourceProviderSelect.addEventListener("change", updateMigDeleteState);
 
-  migDeleteFileInput.addEventListener("change", async () => {
-    const file = migDeleteFileInput.files[0];
-    if (!file) return;
+  function summarizeValidationFailures(failures) {
+    return `access denied: ${failures.accessDenied || 0}, not found: ${failures.notFound || 0}, ` +
+      `invalid URL: ${failures.invalidUrl || 0}, connection error: ${failures.connectionError || 0}`;
+  }
 
-    migDeleteMsg.textContent = "Parsing migration report…";
-    migDeleteMsg.className = "msg";
-    migDeleteSummary.innerHTML = "";
-    migDeleteActionRow.style.display = "none";
-    migDeleteConfirmInput.value = "";
-    migDeleteResult.textContent = "";
-    migDeleteRows = [];
-    migDeleteExcluded = 0;
-    migDeleteExcludedRows = [];
+  // The network-dependent half of the check: verifies migDeleteCheckState.remaining's destination
+  // links are still publicly readable. Safe to call again after a failure/disconnect — each
+  // `progress` event's item-level results trim `remaining` as they arrive, so whatever never got
+  // confirmed stays queued for the next attempt instead of the whole check restarting from zero.
+  async function runMigDeleteCheckAttempt() {
+    const state = migDeleteCheckState;
+    if (!state || state.remaining.length === 0) return;
+
+    migDeleteContinueBtn.style.display = "none";
     migDeleteProgressWrap.style.display = "block";
-    migDeleteProgressBar.style.width = "0%";
-    migDeleteProgressLabel.textContent = "Reading report…";
+    migDeleteProgressBar.style.width = `${Math.round((state.checkedCount / state.totalCount) * 100)}%`;
+    migDeleteProgressLabel.textContent =
+      `${state.checkedCount.toLocaleString()} / ${state.totalCount.toLocaleString()} links checked…`;
+    migDeleteMsg.textContent = `Checking ${state.remaining.length.toLocaleString()} remaining public destination link(s)…`;
+    migDeleteMsg.className = "msg";
 
     try {
-      const formData = new FormData();
-      formData.append("file", file);
+      const items = state.remaining.map(({ bucket, key, destinationUrl, sizeMb, status }) => (
+        { bucket, key, destinationUrl, sizeMb, status }
+      ));
       let data = null;
       await fetchSse(
-        "/storage/validate-copy-delete-report/stream",
-        { method: "POST", body: formData },
+        "/storage/validate-destination-urls/stream",
         {
-          parsed: (d) => {
-            migDeleteMsg.textContent =
-              `Report contains ${d.eligible.toLocaleString()} successful migration row(s). ` +
-              "Checking public destination links…";
-            migDeleteProgressLabel.textContent = `0 / ${d.eligible.toLocaleString()} links checked (0%)`;
-          },
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ items }),
+        },
+        {
           progress: (d) => {
+            // Drop confirmed items from `remaining` as each batch reports back — this is what
+            // makes "Continue" resend only what's left rather than this same batch again.
+            const doneKeys = new Set(d.results.map((r) => `${r.bucket} ${r.key}`));
+            state.remaining = state.remaining.filter((row) => !doneKeys.has(`${row.bucket} ${row.key}`));
+            state.checkedCount = state.totalCount - state.remaining.length;
+
             migDeleteProgressBar.style.width = `${d.percent}%`;
             migDeleteProgressLabel.textContent =
-              `${d.completed.toLocaleString()} / ${d.total.toLocaleString()} links checked (${d.percent}%)`;
+              `${state.checkedCount.toLocaleString()} / ${state.totalCount.toLocaleString()} links checked (${d.percent}%)`;
           },
           done: (d) => { data = d; },
         },
       );
       if (!data) throw new Error("Destination validation did not return a result.");
 
-      migDeleteRows = data.rows;
-      migDeleteExcluded = data.failed + data.incomplete + data.destinationInvalid;
-      migDeleteExcludedRows = data.excludedRows || [];
+      migDeleteRows = migDeleteRows.concat(data.rows);
+      migDeleteExcludedRows = migDeleteExcludedRows.concat(data.excludedRows || []);
       renderMigDeleteSummary();
 
+      migDeleteCheckState = null;
       if (migDeleteRows.length === 0) {
-        migDeleteMsg.textContent =
-          `No safe source files to delete: ${data.reportEligible.toLocaleString()} migrated row(s), ` +
-          `${data.destinationInvalid.toLocaleString()} destination link(s) could not be opened publicly.`;
+        migDeleteMsg.textContent = "No safe source files to delete — every link was excluded.";
         migDeleteMsg.className = "msg err";
         return;
       }
 
-      const failures = data.validationFailures || {};
       migDeleteActionRow.style.display = "flex";
       migDeleteMsg.textContent =
-        `${data.eligible.toLocaleString()} destination link(s) are publicly readable and safe to continue; ` +
-        `${data.destinationInvalid.toLocaleString()} excluded ` +
-        `(access denied: ${failures.accessDenied || 0}, not found: ${failures.notFound || 0}, ` +
-        `invalid URL: ${failures.invalidUrl || 0}, connection error: ${failures.connectionError || 0}).`;
-      migDeleteMsg.className = data.destinationInvalid ? "msg err" : "msg ok";
+        `${migDeleteRows.length.toLocaleString()} destination link(s) are publicly readable and safe to continue; ` +
+        `${migDeleteExcludedRows.length.toLocaleString()} excluded so far ` +
+        `(this batch: ${summarizeValidationFailures(data.validationFailures || {})}).`;
+      migDeleteMsg.className = migDeleteExcludedRows.length ? "msg err" : "msg ok";
       updateMigDeleteState();
+    } catch (err) {
+      // Connection dropped or the request otherwise failed — whatever's still in
+      // state.remaining (trimmed by any `progress` events that did land) is exactly what
+      // "Continue" needs to resend, so keep it around instead of discarding it.
+      migDeleteMsg.textContent = `${err.message} — ${state.remaining.length.toLocaleString()} link(s) still unchecked.`;
+      migDeleteMsg.className = "msg err";
+      if (state.remaining.length > 0) migDeleteContinueBtn.style.display = "inline-block";
+      renderMigDeleteSummary();
+    } finally {
+      migDeleteProgressWrap.style.display = "none";
+    }
+  }
+
+  migDeleteContinueBtn.addEventListener("click", runMigDeleteCheckAttempt);
+
+  migDeleteFileInput.addEventListener("change", async () => {
+    const file = migDeleteFileInput.files[0];
+    if (!file) return;
+
+    migDeleteMsg.textContent = "Parsing migration report…";
+    migDeleteMsg.className = "msg";
+    migDeleteContinueBtn.style.display = "none";
+    migDeleteSummary.innerHTML = "";
+    migDeleteActionRow.style.display = "none";
+    migDeleteConfirmInput.value = "";
+    migDeleteResult.textContent = "";
+    migDeleteRows = [];
+    migDeleteExcludedRows = [];
+    migDeleteCheckState = null;
+
+    try {
+      const formData = new FormData();
+      formData.append("file", file);
+      const body = await fetchJson("/storage/parse-copy-delete-report", { method: "POST", body: formData });
+      const { rows, excluded, eligible } = body.data;
+
+      migDeleteExcludedRows = excluded || [];
+      if (rows.length === 0) {
+        migDeleteMsg.textContent =
+          `No successful migration rows to delete — ${migDeleteExcludedRows.length.toLocaleString()} row(s) excluded.`;
+        migDeleteMsg.className = "msg err";
+        renderMigDeleteSummary();
+        return;
+      }
+
+      migDeleteMsg.textContent =
+        `Report contains ${eligible.toLocaleString()} successful migration row(s). Checking public destination links…`;
+      migDeleteCheckState = { remaining: rows, checkedCount: 0, totalCount: rows.length };
+      await runMigDeleteCheckAttempt();
     } catch (err) {
       migDeleteMsg.textContent = err.message;
       migDeleteMsg.className = "msg err";
-    } finally {
-      migDeleteProgressWrap.style.display = "none";
     }
   });
 
@@ -1523,15 +1708,22 @@
           progress: (d) => {
             migDeleteProgressBar.style.width = `${d.percent}%`;
             migDeleteProgressLabel.textContent = `${d.completed} / ${d.total} deleted (${d.percent}%) — ${d.bucket}`;
+            // Drop rows as each batch actually confirms deletion (not just at the end) — if the
+            // connection drops or the request fails partway, whatever's already succeeded stays
+            // gone from the pending list, so re-running only retries what's left.
+            if (d.results?.some((r) => r.success)) {
+              migDeleteRows = migDeleteRows.filter(
+                (row) => !d.results.some((r) => r.success && r.bucket === row.bucket && r.key === row.key)
+              );
+              renderMigDeleteSummary();
+            }
           },
           done: (d) => {
-            const { succeededCount, failedCount, auditFile, reportFile, results } = d;
+            const { succeededCount, failedCount, auditFile, reportFile } = d;
             migDeleteResult.innerHTML =
               `Deleted ${succeededCount} file(s) from ${sourceProvider}${failedCount ? `, ${failedCount} failed` : ""}. ` +
               `Audit log: ${auditFile}${reportFile ? ` — ${reportLink(reportFile)}` : ""}`;
             migDeleteResult.className = failedCount ? "msg err" : "msg ok";
-
-            migDeleteRows = migDeleteRows.filter((_row, index) => !results[index]?.success);
             renderMigDeleteSummary();
           },
         },
@@ -1545,37 +1737,191 @@
     }
   });
 
+  // --- Delete previously excluded files (upload a deletion report, retry its Excluded sheet) ---
+  const excludedDeleteFileInput = document.getElementById("excludedDeleteFileInput");
+  const excludedDeleteSourceProviderSelect = document.getElementById("excludedDeleteSourceProvider");
+  const excludedDeleteMsg = document.getElementById("excludedDeleteMsg");
+  const excludedDeleteSummary = document.getElementById("excludedDeleteSummary");
+  const excludedDeleteActionRow = document.getElementById("excludedDeleteActionRow");
+  const excludedDeleteConfirmInput = document.getElementById("excludedDeleteConfirmInput");
+  const excludedDeleteRunBtn = document.getElementById("excludedDeleteRunBtn");
+  const excludedDeleteProgressWrap = document.getElementById("excludedDeleteProgressWrap");
+  const excludedDeleteProgressBar = document.getElementById("excludedDeleteProgressBar");
+  const excludedDeleteProgressLabel = document.getElementById("excludedDeleteProgressLabel");
+  const excludedDeleteResult = document.getElementById("excludedDeleteResult");
+
+  let excludedDeleteRows = []; // rows that re-validated OK: {bucket, key, status}
+  let excludedDeleteStillExcluded = []; // rows still excluded, for the audit trail / report
+
+  function renderExcludedDeleteSummary() {
+    if (!excludedDeleteRows.length && !excludedDeleteStillExcluded.length) {
+      excludedDeleteSummary.innerHTML = "";
+      return;
+    }
+    const buckets = new Set(excludedDeleteRows.map((row) => row.bucket)).size;
+    excludedDeleteSummary.innerHTML = `
+      <div class="stat err"><div class="n">${excludedDeleteRows.length.toLocaleString()}</div><div class="l">eligible to delete</div></div>
+      <div class="stat"><div class="n">${buckets.toLocaleString()}</div><div class="l">source buckets</div></div>
+      <div class="stat warn"><div class="n">${excludedDeleteStillExcluded.length.toLocaleString()}</div><div class="l">still excluded</div></div>
+    `;
+  }
+
+  function updateExcludedDeleteState() {
+    const confirmed = excludedDeleteConfirmInput.value.trim() === DELETE_CONFIRM_PHRASE;
+    excludedDeleteRunBtn.disabled = !(excludedDeleteRows.length > 0 && confirmed && excludedDeleteSourceProviderSelect.value);
+  }
+
+  excludedDeleteConfirmInput.addEventListener("input", updateExcludedDeleteState);
+  excludedDeleteSourceProviderSelect.addEventListener("change", updateExcludedDeleteState);
+
+  excludedDeleteFileInput.addEventListener("change", async () => {
+    const file = excludedDeleteFileInput.files[0];
+    if (!file) return;
+
+    excludedDeleteMsg.textContent = "Parsing deletion report…";
+    excludedDeleteMsg.className = "msg";
+    excludedDeleteSummary.innerHTML = "";
+    excludedDeleteActionRow.style.display = "none";
+    excludedDeleteConfirmInput.value = "";
+    excludedDeleteResult.textContent = "";
+    excludedDeleteRows = [];
+    excludedDeleteStillExcluded = [];
+    excludedDeleteProgressWrap.style.display = "block";
+    excludedDeleteProgressBar.style.width = "0%";
+    excludedDeleteProgressLabel.textContent = "Reading report…";
+
+    try {
+      const formData = new FormData();
+      formData.append("file", file);
+      let data = null;
+      await fetchSse(
+        "/storage/validate-deletion-excluded-report/stream",
+        { method: "POST", body: formData },
+        {
+          parsed: (d) => {
+            excludedDeleteMsg.textContent =
+              `Excluded sheet contains ${d.eligible.toLocaleString()} row(s) worth re-checking ` +
+              `(${d.unretryable.toLocaleString()} missing bucket/key/URL, skipped). Checking public destination links…`;
+            excludedDeleteProgressLabel.textContent = `0 / ${d.eligible.toLocaleString()} links checked (0%)`;
+          },
+          progress: (d) => {
+            excludedDeleteProgressBar.style.width = `${d.percent}%`;
+            excludedDeleteProgressLabel.textContent =
+              `${d.completed.toLocaleString()} / ${d.total.toLocaleString()} links checked (${d.percent}%)`;
+          },
+          done: (d) => { data = d; },
+        },
+      );
+      if (!data) throw new Error("Destination validation did not return a result.");
+
+      excludedDeleteRows = data.rows;
+      excludedDeleteStillExcluded = data.excludedRows || [];
+      renderExcludedDeleteSummary();
+
+      if (excludedDeleteRows.length === 0) {
+        excludedDeleteMsg.textContent = "No previously-excluded files are safe to delete yet.";
+        excludedDeleteMsg.className = "msg err";
+        return;
+      }
+
+      const failures = data.validationFailures || {};
+      excludedDeleteActionRow.style.display = "flex";
+      excludedDeleteMsg.textContent =
+        `${data.eligible.toLocaleString()} destination link(s) are now publicly readable and safe to delete; ` +
+        `${data.stillExcluded.toLocaleString()} still excluded ` +
+        `(access denied: ${failures.accessDenied || 0}, not found: ${failures.notFound || 0}, ` +
+        `invalid URL: ${failures.invalidUrl || 0}, connection error: ${failures.connectionError || 0}).`;
+      excludedDeleteMsg.className = "msg ok";
+      updateExcludedDeleteState();
+    } catch (err) {
+      excludedDeleteMsg.textContent = err.message;
+      excludedDeleteMsg.className = "msg err";
+    } finally {
+      excludedDeleteProgressWrap.style.display = "none";
+    }
+  });
+
+  excludedDeleteRunBtn.addEventListener("click", async () => {
+    const sourceProvider = excludedDeleteSourceProviderSelect.value;
+    const items = excludedDeleteRows.map((row) => ({ bucket: row.bucket, key: row.key }));
+
+    if (!sourceProvider) {
+      excludedDeleteResult.textContent = "Select the source provider first.";
+      excludedDeleteResult.className = "msg err";
+      return;
+    }
+    if (!confirm(`Permanently delete ${items.length} file(s) from ${sourceProvider}? This cannot be undone.`)) return;
+
+    excludedDeleteRunBtn.disabled = true;
+    excludedDeleteResult.textContent = "";
+    excludedDeleteProgressWrap.style.display = "block";
+    excludedDeleteProgressBar.style.width = "0%";
+    excludedDeleteProgressLabel.textContent = `0 / ${items.length} deleted (0%)`;
+
+    try {
+      const payload = {
+        items,
+        excluded: excludedDeleteStillExcluded,
+        confirm: excludedDeleteConfirmInput.value.trim(),
+        provider: sourceProvider,
+      };
+
+      await fetchSse(
+        "/storage/delete/stream",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        },
+        {
+          progress: (d) => {
+            excludedDeleteProgressBar.style.width = `${d.percent}%`;
+            excludedDeleteProgressLabel.textContent = `${d.completed} / ${d.total} deleted (${d.percent}%) — ${d.bucket}`;
+            if (d.results?.some((r) => r.success)) {
+              excludedDeleteRows = excludedDeleteRows.filter(
+                (row) => !d.results.some((r) => r.success && r.bucket === row.bucket && r.key === row.key)
+              );
+              renderExcludedDeleteSummary();
+            }
+          },
+          done: (d) => {
+            const { succeededCount, failedCount, auditFile, reportFile } = d;
+            excludedDeleteResult.innerHTML =
+              `Deleted ${succeededCount} file(s) from ${sourceProvider}${failedCount ? `, ${failedCount} failed` : ""}. ` +
+              `Audit log: ${auditFile}${reportFile ? ` — ${reportLink(reportFile)}` : ""}`;
+            excludedDeleteResult.className = failedCount ? "msg err" : "msg ok";
+            renderExcludedDeleteSummary();
+          },
+        },
+      );
+    } catch (err) {
+      excludedDeleteResult.textContent = err.message;
+      excludedDeleteResult.className = "msg err";
+    } finally {
+      excludedDeleteProgressWrap.style.display = "none";
+      updateExcludedDeleteState();
+    }
+  });
+
   // --- Delete files from report ---
   const deleteFileInput = document.getElementById("deleteFileInput");
+  const deleteSourceProviderSelect = document.getElementById("deleteSourceProvider");
   const deleteMsg = document.getElementById("deleteMsg");
-  const deleteTableWrap = document.getElementById("deleteTableWrap");
-  const deleteTableBody = document.getElementById("deleteTableBody");
-  const deleteSelectAll = document.getElementById("deleteSelectAll");
   const deleteSummary = document.getElementById("deleteSummary");
   const deleteActionRow = document.getElementById("deleteActionRow");
   const deleteConfirmInput = document.getElementById("deleteConfirmInput");
   const deleteRunBtn = document.getElementById("deleteRunBtn");
   const deleteResult = document.getElementById("deleteResult");
 
-  let deleteRows = []; // parsed from the uploaded report: {path, bucket, key, sizeMb, lastModified}
-
-  function checkedDeleteBoxes() {
-    return Array.from(deleteTableBody.querySelectorAll("input[type=checkbox]"));
-  }
+  let deleteRows = []; // parsed from the uploaded report: {path, bucket, key, sizeMb, lastModified} — every row is processed, none are individually selectable
 
   function updateDeleteState() {
-    const boxes = checkedDeleteBoxes();
-    const checked = boxes.filter((cb) => cb.checked);
-    const totalMb = checked.reduce((sum, cb) => sum + (parseFloat(cb.dataset.sizeMb) || 0), 0);
-    deleteSummary.textContent = checked.length
-      ? `${checked.length} file(s) selected — ${totalMb.toLocaleString(undefined, { maximumFractionDigits: 2 })} MB total`
-      : "";
-    deleteSelectAll.checked = boxes.length > 0 && checked.length === boxes.length;
     const confirmed = deleteConfirmInput.value.trim() === DELETE_CONFIRM_PHRASE;
-    deleteRunBtn.disabled = !(checked.length > 0 && confirmed);
+    deleteRunBtn.disabled = !(deleteRows.length > 0 && confirmed && deleteSourceProviderSelect.value);
   }
 
   deleteConfirmInput.addEventListener("input", updateDeleteState);
+  deleteSourceProviderSelect.addEventListener("change", updateDeleteState);
 
   deleteFileInput.addEventListener("change", async () => {
     const file = deleteFileInput.files[0];
@@ -1583,8 +1929,7 @@
 
     deleteMsg.textContent = "Parsing report…";
     deleteMsg.className = "msg";
-    deleteTableWrap.style.display = "none";
-    deleteTableBody.innerHTML = "";
+    deleteSummary.textContent = "";
     deleteActionRow.style.display = "none";
     deleteResult.textContent = "";
     deleteConfirmInput.value = "";
@@ -1601,22 +1946,13 @@
         return;
       }
 
-      deleteRows.forEach((row, i) => {
-        const tr = document.createElement("tr");
-        tr.innerHTML = `
-          <td><input type="checkbox" data-index="${i}" data-size-mb="${row.sizeMb || 0}" /></td>
-          <td style="word-break:break-all;">${row.path ?? ""}</td>
-          <td>${row.sizeMb ?? ""}</td>
-          <td>${row.lastModified ?? ""}</td>
-        `;
-        tr.querySelector("input[type=checkbox]").addEventListener("change", updateDeleteState);
-        deleteTableBody.appendChild(tr);
-      });
-
-      deleteTableWrap.style.display = "block";
-      deleteActionRow.style.display = "flex";
-      deleteMsg.textContent = `Loaded ${deleteRows.length} row(s) from "${file.name}". Nothing is selected yet.`;
+      const totalMb = deleteRows.reduce((sum, row) => sum + (parseFloat(row.sizeMb) || 0), 0);
+      deleteMsg.textContent = `Loaded ${deleteRows.length} row(s) from "${file.name}".`;
       deleteMsg.className = "msg ok";
+      deleteSummary.textContent =
+        `${deleteRows.length} file(s) — ${totalMb.toLocaleString(undefined, { maximumFractionDigits: 2 })} MB total. ` +
+        `All of them will be archived; only verified originals will be deleted — type "${DELETE_CONFIRM_PHRASE}" to proceed.`;
+      deleteActionRow.style.display = "flex";
       updateDeleteState();
     } catch (err) {
       deleteMsg.textContent = err.message;
@@ -1624,33 +1960,29 @@
     }
   });
 
-  deleteSelectAll.addEventListener("change", () => {
-    checkedDeleteBoxes().forEach((cb) => { cb.checked = deleteSelectAll.checked; });
-    updateDeleteState();
-  });
-
   const deleteProgressWrap = document.getElementById("deleteProgressWrap");
   const deleteProgressBar = document.getElementById("deleteProgressBar");
   const deleteProgressLabel = document.getElementById("deleteProgressLabel");
 
   deleteRunBtn.addEventListener("click", async () => {
-    const checked = checkedDeleteBoxes().filter((cb) => cb.checked);
-    const items = checked.map((cb) => {
-      const row = deleteRows[Number(cb.dataset.index)];
-      return { bucket: row.bucket, key: row.key, path: row.path, sizeMb: row.sizeMb };
-    });
+    const sourceProvider = deleteSourceProviderSelect.value;
+    const items = deleteRows.map((row) => ({ bucket: row.bucket, key: row.key, path: row.path, sizeMb: row.sizeMb }));
 
-    if (!confirm(`Permanently delete ${items.length} file(s)? This cannot be undone.`)) return;
+    if (!sourceProvider) {
+      deleteResult.textContent = "Select the source provider first.";
+      deleteResult.className = "msg err";
+      return;
+    }
+    if (!confirm(`Archive ${items.length} file(s) from ${sourceProvider} to scola-school-archives, with private presigned download links? Only originals with verified archive downloads will be deleted.`)) return;
 
     deleteRunBtn.disabled = true;
     deleteResult.textContent = "";
     deleteProgressWrap.style.display = "block";
     deleteProgressBar.style.width = "0%";
-    deleteProgressLabel.textContent = `0 / ${items.length} deleted (0%)`;
+    deleteProgressLabel.textContent = `Archiving 0 / ${items.length} (0%)`;
 
     try {
-      const payload = { items, confirm: deleteConfirmInput.value.trim() };
-      if (selectedProvider()) payload.provider = selectedProvider();
+      const payload = { items, confirm: deleteConfirmInput.value.trim(), provider: sourceProvider };
 
       await fetchSse(
         "/storage/delete/stream",
@@ -1660,24 +1992,30 @@
           body: JSON.stringify(payload),
         },
         {
-          progress: (d) => {
-            deleteProgressBar.style.width = `${d.percent}%`;
-            deleteProgressLabel.textContent = `${d.completed} / ${d.total} deleted (${d.percent}%) — ${d.bucket}`;
+          copy_progress: (d) => {
+            deleteProgressBar.style.width = `${d.percent / 2}%`;
+            deleteProgressLabel.textContent = `Archiving ${d.completed} / ${d.total} (${d.percent}%)${d.success ? "" : ` - failed: ${d.key}`}`;
+          },
+          delete_progress: (d) => {
+            deleteProgressBar.style.width = `${50 + d.percent / 2}%`;
+            deleteProgressLabel.textContent = `Verifying archives and deleting confirmed sources: ${d.completed} / ${d.total}`;
           },
           done: (d) => {
-            const { succeededCount, failedCount, auditFile, reportFile, results } = d;
-            deleteResult.innerHTML =
-              `Deleted ${succeededCount} file(s)${failedCount ? `, ${failedCount} failed` : ""}. ` +
-              `Audit log: ${auditFile}${reportFile ? ` — ${reportLink(reportFile)}` : ""}`;
-            deleteResult.className = failedCount ? "msg err" : "msg ok";
-
-            // Drop successfully-deleted rows from the table/model so it reflects what's actually left.
-            results.forEach((r, i) => {
-              if (r.success) checked[i].closest("tr").remove();
-            });
-            deleteRows = deleteRows.filter(
-              (row) => !results.some((r) => r.success && r.bucket === row.bucket && r.key === row.key)
-            );
+            const { deletedCount, copyFailedCount, archivedNotDeletedCount, auditFile, reportFile, archiveBucketPolicyError } = d;
+            if (!archiveBucketPolicyError) {
+              deleteRows = deleteRows.filter((row) => !d.results.some(
+                (r) => r.deleteSuccess && r.bucket === row.bucket && r.key === row.key
+              ));
+            }
+            const parts = [`Verified and deleted ${deletedCount} file(s); ${archivedNotDeletedCount} archived with source retained`];
+            if (d.publicAccessWarningCount) parts.push(`${d.publicAccessWarningCount} archive(s): public access not confirmed; see report`);
+            if (copyFailedCount) parts.push(`${copyFailedCount} failed to archive (left in place)`);
+            let html = `${parts.join(", ")}. Audit log: ${auditFile}${reportFile ? ` — ${reportLink(reportFile)}` : ""}`;
+            if (archiveBucketPolicyError) {
+              html += `<br />Warning: couldn't confirm scola-school-archives is publicly readable (${archiveBucketPolicyError}) — archived file URLs may not open until this is fixed.`;
+            }
+            deleteResult.innerHTML = html;
+            deleteResult.className = copyFailedCount || archivedNotDeletedCount || archiveBucketPolicyError || d.publicAccessWarningCount ? "msg err" : "msg ok";
           },
         },
       );

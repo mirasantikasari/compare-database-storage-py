@@ -36,9 +36,13 @@ or when discovery misses something. Database is optional; when given, the same r
 protection check still runs.
 
 ### Delete files from report
-Upload a previously-downloaded Orphan/Cleanup Candidates report, tick the rows you actually want
-gone, type a literal confirmation phrase, and delete — with a live progress bar and a permanent
-JSON audit trail. See [Delete safety design](#delete-safety-design).
+Upload a reviewed Orphan/Cleanup Candidates report to archive files into
+`scola-school-archives/<source bucket>/<source key>`. Before deleting each source,
+the application downloads the archive through a presigned URL, compares the complete
+SHA-256 and size against the source, and checks that source metadata has not changed.
+Failed copies or verification checks retain the source. Existing archive copies must
+pass the same checks. Reports include verification errors and deletion outcomes.
+Verification reads both full files, which adds transfer time and storage read traffic.
 
 ### Copy files to another provider
 Upload a previously-downloaded reconciliation report and read back its `Matched` sheet — files
@@ -181,6 +185,10 @@ one of these exists because of a real problem hit while building it:
 - **Streamed progress.** `POST /storage/delete/stream` reports progress in batches of 50 (not
   the S3 max of 1000) specifically so a human-reviewed, human-sized selection shows meaningful
   incremental progress instead of jumping straight from 0% to 100%.
+- **Retrying excluded rows.** "Delete previously excluded files" (`/storage/validate-deletion-
+  excluded-report/stream`) reads a deletion report's own `Excluded` sheet back in and re-checks
+  each destination link — useful since many exclusions are transient (e.g. a connection timeout
+  during the original run), not a permanent reason the file is unsafe to delete.
 
 ## Architecture
 
@@ -222,8 +230,10 @@ All settings are environment variables (see `.env.example` for the full annotate
 | `REPORTS_DIR` | `reports` | Where `.xlsx` reports and `.deletions/*.json` audit logs are written |
 | `STORAGE_SUMMARY_CONCURRENCY` | `8` | Parallel S3-compatible API calls |
 | `STORAGE_COPY_CONCURRENCY` | `4` | Parallel object copies between providers (streams full bytes, unlike the summary scan) |
+| `STORAGE_DELETE_CONCURRENCY` | `8` | Parallel DeleteObjects batches when deleting already-migrated files |
 | `DB_SCAN_CONCURRENCY` | `2` | Parallel MySQL table/column scans — keep low against a production primary |
 | `MAX_CONTENT_SCAN_TABLE_ROWS` | `50000` | Tables at/above this estimated row count skip content scanning |
+| `S3_MAX_POOL_CONNECTIONS` | `50` | Max simultaneous HTTP connections per provider's shared boto3 client; raise if you see urllib3 "Connection pool is full" warnings |
 
 ## API reference
 
@@ -234,6 +244,8 @@ All settings are environment variables (see `.env.example` for the full annotate
 | GET | `/storage/summary` / `/storage/summary/stream` | Object count/size per bucket |
 | GET | `/storage/{bucket}/objects` | Paginated object listing |
 | POST | `/storage/parse-report` | Parse an uploaded Orphan/Cleanup Candidates report |
+| POST | `/storage/validate-copy-delete-report/stream` | Parse a migration report's Copied sheet and re-verify each destination link before delete (SSE) |
+| POST | `/storage/validate-deletion-excluded-report/stream` | Re-check a deletion report's Excluded sheet — retries exclusions caused by a transient link-check failure (SSE) |
 | POST | `/storage/delete` | Delete objects (blocking, single response) |
 | POST | `/storage/delete/stream` | Delete objects (SSE, live progress) |
 | POST | `/storage/parse-matched-report` | Parse an uploaded reconciliation report's Matched sheet |
@@ -257,3 +269,5 @@ Every run writes a `.xlsx` to `REPORTS_DIR` (default `reports/`) named
 `Protected`, `Summary` (DO cleanup). A scan interrupted partway through resumes from a checkpoint
 in `REPORTS_DIR/.checkpoints/` rather than restarting; delete audit logs live in
 `REPORTS_DIR/.deletions/`.
+
+Archive reports now provide private presigned download URLs valid for 7 days, with UTC expiration timestamps. Re-run the original input report to generate fresh links; existing archive objects are reused; sources are deleted only after download verification. Archive processing does not attempt public ACLs or bucket policies. Anyone possessing a signed link can download until it expires.
