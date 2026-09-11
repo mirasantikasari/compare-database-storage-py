@@ -715,6 +715,7 @@ def archive_and_delete_objects(
             # Use the expected destination, never a URL supplied by the uploaded report.
             dest_key = _archive_dest_key(bucket, key)
             source_meta = source_client.head_object(Bucket=bucket, Key=key)
+            result["sizeBytes"] = source_meta["ContentLength"]
             archive_meta = archive_client.head_object(Bucket=archive_bucket, Key=dest_key)
             if source_meta["ContentLength"] != archive_meta["ContentLength"]:
                 raise ValueError("Archive size differs from source; source retained")

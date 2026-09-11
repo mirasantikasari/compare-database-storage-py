@@ -2014,6 +2014,17 @@
             if (archiveBucketPolicyError) {
               html += `<br />Warning: couldn't confirm scola-school-archives is publicly readable (${archiveBucketPolicyError}) — archived file URLs may not open until this is fixed.`;
             }
+            if (d.sizeSummary) {
+              html += '<br />' + [
+                ['Total diproses', 'total'], ['Terhapus', 'deleted'],
+                ['Diarsipkan, sumber disimpan', 'archivedNotDeleted'],
+                ['Gagal diarsipkan', 'copyFailed'], ['Dikecualikan', 'excluded']
+              ].map(([label, key]) => {
+                const size = d.sizeSummary[key];
+                return `${label}: ${size.sizeGb.toLocaleString('id-ID', {minimumFractionDigits: 3, maximumFractionDigits: 6})} GB (${size.count} file${size.unknownSizeCount ? `; ${size.unknownSizeCount} ukuran tidak diketahui` : ''}${size.estimatedSizeCount ? `; ${size.estimatedSizeCount} estimasi dari report` : ''})`;
+              }).join('<br />');
+              html += '<br /><small>GB = 1024 MB (GiB). Ukuran tidak diketahui tidak masuk total.</small>';
+            }
             deleteResult.innerHTML = html;
             deleteResult.className = copyFailedCount || archivedNotDeletedCount || archiveBucketPolicyError || d.publicAccessWarningCount ? "msg err" : "msg ok";
           },

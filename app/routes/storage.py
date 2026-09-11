@@ -1,3 +1,4 @@
+from app.services.archive_summary import archive_size_summary
 import asyncio
 import io
 import json
@@ -591,6 +592,7 @@ async def delete(body: DeleteBody):
         "data": {
             "results": results,
             **_archive_deletion_counts(results),
+            "sizeSummary": archive_size_summary(results, [i.model_dump() for i in body.items], body.excluded or []),
             "auditFile": audit_file,
             "reportFile": report_file,
             "archiveBucketPolicyError": policy_error,
@@ -652,6 +654,7 @@ async def delete_stream(body: DeleteBody):
             {
                 "results": results,
                 **_archive_deletion_counts(results),
+            "sizeSummary": archive_size_summary(results, [i.model_dump() for i in body.items], body.excluded or []),
                 "auditFile": audit_file,
                 "reportFile": report_file,
                 "archiveBucketPolicyError": policy_error,

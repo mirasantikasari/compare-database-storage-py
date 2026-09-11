@@ -1,3 +1,4 @@
+from app.services.archive_summary import archive_size_summary
 import os
 import re
 import tempfile
@@ -544,11 +545,15 @@ def generate_archive_deletion_report(
         )
 
     summary = workbook.create_sheet("Summary", 0)
-    summary.append(_header_row(summary, ["Status", "Count"]))
-    for label, count in counts.items():
-        summary.append([label, count])
-    summary.append(["Excluded", len(excluded_rows)])
-    summary.append(["Archive links", "Presigned GET URLs valid for 7 days. Regenerate report after expiry. Anyone with the link can download until expiry."])
+    summary.append(_header_row(summary, ["Status", "Count", "Size (GB)", "Unknown size files", "Estimated size files"]))
+    sizes = archive_size_summary(results, requested, excluded_rows)
+    for label, name in (("Total processed", "total"), ("Archived & Deleted", "deleted"),
+                        ("Archived, Not Deleted", "archivedNotDeleted"),
+                        ("Copy Failed (Not Deleted)", "copyFailed"), ("Excluded", "excluded")):
+        group = sizes[name]
+        summary.append([label, group["count"], group["sizeGb"], group["unknownSizeCount"], group["estimatedSizeCount"]])
+    summary.append(["Size basis", "GB uses 1024 MB (GiB). Metadata bytes when available; otherwise estimated from report MB. Unknown sizes excluded from totals."])
+    summary.append(["Archive links", "Presigned GET URLs valid for 7 days. Anyone with the link can download until expiry."])
     return _save_workbook(workbook, file_name)
 
 
