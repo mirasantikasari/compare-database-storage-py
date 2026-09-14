@@ -271,3 +271,7 @@ in `REPORTS_DIR/.checkpoints/` rather than restarting; delete audit logs live in
 `REPORTS_DIR/.deletions/`.
 
 Archive reports now provide private presigned download URLs valid for 7 days, with UTC expiration timestamps. Re-run the original input report to generate fresh links; existing archive objects are reused; sources are deleted only after download verification. Archive processing does not attempt public ACLs or bucket policies. Anyone possessing a signed link can download until it expires.
+
+The archive panel streams copy byte progress, skipped-copy counts, source/archive hash read progress, per-file verification and deletion outcomes, and report generation. The Continue button retries only remaining rows in the current page; keep the page open to retain this retry list. Existing destination objects are not uploaded again, and metadata errors other than not-found never trigger an overwrite. Concurrent archive attempts in the same server process are rejected while an earlier run is active.
+
+Archive stream reconnection: the server retains the latest eight jobs in process memory. Reconnecting the same active report attaches to its existing worker and replays progress, including completed file outcomes. The browser offers "Sambungkan progres proses aktif" after a disconnected stream; after completion, Continue retries remaining files. Job state does not survive server restart and requires a single server worker. An archive run started before this feature was loaded cannot be reattached.

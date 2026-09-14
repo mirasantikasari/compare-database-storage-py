@@ -73,6 +73,7 @@ class ArchiveVisibilityTests(unittest.TestCase):
 
 class VerifiedDeletionTests(unittest.TestCase):
     def run_case(self, archived=b"data", link_error=None, size=4, changed=False):
+        self.events = []
         import io
         source, archive = Mock(), Mock()
         meta = dict(ContentLength=4, ETag='"etag"')
@@ -89,7 +90,7 @@ class VerifiedDeletionTests(unittest.TestCase):
              patch.object(storage, "build_archive_presigned_url", return_value="https://example.test/file"), \
              patch.object(storage, "urlopen", return_value=response, side_effect=link_error), \
              patch.object(storage, "delete_objects", return_value=[dict(success=True)]) as delete:
-            result = storage.archive_and_delete_objects([("school", "file")], "source", "archive", "scola-school-archives")[0]
+            result = storage.archive_and_delete_objects([("school", "file")], "source", "archive", "scola-school-archives", on_archive_progress=self.events.append)[0]
             return result, delete.call_count
 
     def test_matching_existing_archive_deleted(self):
@@ -123,3 +124,49 @@ class VerifiedDeletionTests(unittest.TestCase):
     def test_archive_cannot_be_deleted(self):
         with self.assertRaises(ValueError):
             storage.archive_and_delete_objects([("scola-school-archives", "file")], "source", "archive", "scola-school-archives")
+
+
+    def test_progress_for_every_verification_phase(self):
+        self.run_case()
+        phases = [event["phase"] for event in self.events]
+        for phase in ("checking", "verify_source", "verify_archive", "deleting", "item_done"):
+            self.assertIn(phase, phases)
+        self.assertEqual(phases[-1], "item_done")
+        self.assertEqual(self.events[-1]["completed"], 1)
+        self.assertTrue(self.events[-1]["result"]["deleteSuccess"])
+
+    def test_failed_verification_emits_terminal_progress(self):
+        self.run_case(link_error=OSError("connection lost"))
+        self.assertEqual(self.events[-1]["phase"], "item_done")
+        self.assertFalse(self.events[-1]["result"]["deleteAttempted"])
+
+    def test_concurrent_archive_rejected(self):
+        storage._archive_run_lock.acquire()
+        try:
+            with self.assertRaisesRegex(RuntimeError, "still active"):
+                storage.archive_and_delete_objects([], "source", "archive", "scola-school-archives")
+        finally:
+            storage._archive_run_lock.release()
+
+
+class ArchiveCopySkipTests(unittest.TestCase):
+    def test_existing_archive_never_uploaded_again(self):
+        source, destination = Mock(), Mock()
+        with patch.object(storage, "get_s3_client", side_effect=[source, destination]), \
+             patch.object(storage, "_ensure_dest_buckets", return_value={}):
+            result = storage.copy_objects([("school", "file")], "source", "archive",
+                dest_bucket="scola-school-archives", make_public=False,
+                dest_key_fn=storage._archive_dest_key)[0]
+        self.assertTrue(result["skipped"])
+        source.get_object.assert_not_called()
+        destination.upload_fileobj.assert_not_called()
+
+    def test_archive_metadata_error_never_overwrites(self):
+        source, destination = Mock(), Mock()
+        destination.head_object.side_effect = ClientError({"Error": {"Code": "AccessDenied"}}, "HeadObject")
+        with patch.object(storage, "get_s3_client", side_effect=[source, destination]), \
+             patch.object(storage, "_ensure_dest_buckets", return_value={}):
+            result = storage.copy_objects([("school", "file")], "source", "archive",
+                dest_bucket="scola-school-archives", make_public=False)[0]
+        self.assertFalse(result["success"])
+        destination.upload_fileobj.assert_not_called()

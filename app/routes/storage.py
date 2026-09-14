@@ -1,3 +1,4 @@
+from app.services.archive_jobs import archive_jobs
 from app.services.archive_summary import archive_size_summary
 import asyncio
 import io
@@ -513,6 +514,8 @@ class DeleteBody(BaseModel):
     provider: str | None = None
     confirm: str
 
+    archiveJobId: str | None = None
+
 
 def _write_deletion_audit_log(
     provider: str | None,
@@ -637,14 +640,19 @@ async def delete_stream(body: DeleteBody):
         # Best-effort: see the matching comment in POST /delete. Never blocks archiving.
         policy_error = None  # Private archives use signed links.
 
+        emit("archive_phase", {"phase": "prepare", "message": "Menyiapkan arsip dan mengecek file yang sudah ada..."})
         results = archive_and_delete_objects(
             items, body.provider, env.archive_provider, env.archive_bucket,
             delete_batch_size=_DELETE_STREAM_BATCH_SIZE,
             on_copy_progress=on_copy_progress, on_delete_progress=on_delete_progress,
+            on_item_progress=lambda key, transferred, total_bytes: emit("archive_bytes", {
+                "key": key, "transferred": transferred, "totalBytes": total_bytes}),
+            on_archive_progress=lambda event: emit("archive_progress", event),
         )
         audit_file = _write_deletion_audit_log(
             body.provider, [i.model_dump() for i in body.items], results, body.excluded
         )
+        emit("archive_phase", {"phase": "report", "message": "Membuat report dan presigned URL..."})
         report_file = generate_archive_deletion_report(
             [i.model_dump() for i in body.items], results, body.excluded, env.archive_provider,
         )
@@ -661,8 +669,14 @@ async def delete_stream(body: DeleteBody):
             },
         )
 
+    try:
+        job = archive_jobs.connect(
+            body.provider or env.s3_default_provider_key,
+            [(item.bucket, item.key) for item in body.items], work, body.archiveJobId)
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
     return StreamingResponse(
-        sse_stream(work),
+        archive_jobs.stream(job),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
     )

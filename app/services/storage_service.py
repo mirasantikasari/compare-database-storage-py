@@ -1,3 +1,4 @@
+from functools import wraps
 import hashlib
 import json
 import re
@@ -522,8 +523,10 @@ def copy_objects(
                 try:
                     dst_client.head_object(Bucket=target_bucket, Key=target_key)
                     skipped = True
-                except ClientError:
-                    skipped = False  # not found at the destination (or a transient error) -> copy for real
+                except ClientError as error:
+                    if str(error.response.get("Error", {}).get("Code")) not in {"404", "NoSuchKey", "NotFound"}:
+                        raise
+                    skipped = False
 
             if skipped:
                 # Existing destination objects may have been created privately by an earlier run.
@@ -653,6 +656,22 @@ def ensure_public_read_bucket_policy(provider: str, bucket: str) -> str | None:
         return str(error)
 
 
+_archive_run_lock = threading.Lock()
+
+
+def _single_archive_run(function):
+    @wraps(function)
+    def guarded(*args, **kwargs):
+        if not _archive_run_lock.acquire(blocking=False):
+            raise RuntimeError("An archive run is still active. Wait for it to finish before continuing.")
+        try:
+            return function(*args, **kwargs)
+        finally:
+            _archive_run_lock.release()
+    return guarded
+
+
+@_single_archive_run
 def archive_and_delete_objects(
     items: list[tuple[str, str]],
     source_provider: str | None,
@@ -663,6 +682,7 @@ def archive_and_delete_objects(
     on_copy_progress: Callable[[int, int, str, bool, bool], None] | None = None,
     on_item_progress: Callable[[str, int, int], None] | None = None,
     on_delete_progress: Callable[[int, int, str, list[dict]], None] | None = None,
+    on_archive_progress: Callable[[dict], None] | None = None,
 ) -> list[dict]:
     """Delete sources only after a signed archive download matches their full contents."""
     if archive_bucket != "scola-school-archives":
@@ -705,12 +725,35 @@ def archive_and_delete_objects(
         )
     source_client = get_s3_client(resolved_source) if items else None
     archive_client = get_s3_client(archive_provider) if items else None
-    for index, result in enumerate(merged):
+
+    verify_completed = 0
+    verify_lock = threading.Lock()
+
+    def progress(phase, index, result, transferred=0, total_bytes=0, completed=None):
+        if on_archive_progress:
+            on_archive_progress({"phase": phase, "completed": completed if completed is not None else index,
+                                 "total": len(merged), "bucket": result["bucket"], "key": result["key"],
+                                 "transferred": transferred, "totalBytes": total_bytes,
+                                 "result": dict(result) if phase == "item_done" else None})
+
+    def mark_done() -> int:
+        nonlocal verify_completed
+        with verify_lock:
+            verify_completed += 1
+            return verify_completed
+
+    # Verification downloads the full object twice (source + archive) and hashes both, so this
+    # step is far more I/O-heavy per item than the copy phase above — running it one item at a
+    # time made large reports painfully slow. Reuse the same concurrency as the copy phase.
+    def verify_and_delete_one(index: int) -> None:
+        result = merged[index]
         result["archiveVerified"] = False
         result["verificationError"] = None
         if not result["copySuccess"]:
-            continue
+            progress("item_done", index, result, completed=mark_done())
+            return
         bucket, key = result["bucket"], result["key"]
+        progress("checking", index, result)
         try:
             # Use the expected destination, never a URL supplied by the uploaded report.
             dest_key = _archive_dest_key(bucket, key)
@@ -720,25 +763,31 @@ def archive_and_delete_objects(
             if source_meta["ContentLength"] != archive_meta["ContentLength"]:
                 raise ValueError("Archive size differs from source; source retained")
             source = source_client.get_object(Bucket=bucket, Key=key, IfMatch=source_meta["ETag"])
-            def digest(stream):
+            def digest(stream, phase):
                 sha = hashlib.sha256()
                 size = 0
+                last_emit = 0.0
+                progress(phase, index, result, 0, source_meta["ContentLength"])
                 while True:
                     chunk = stream.read(1024 * 1024)
                     if not chunk:
                         break
                     sha.update(chunk)
                     size += len(chunk)
+                    now = time.monotonic()
+                    if now - last_emit >= 0.25 or size == source_meta["ContentLength"]:
+                        progress(phase, index, result, size, source_meta["ContentLength"])
+                        last_emit = now
                 return size, sha.digest()
             try:
-                source_digest = digest(source["Body"])
+                source_digest = digest(source["Body"], "verify_source")
             finally:
                 source["Body"].close()
             signed_url = build_archive_presigned_url(archive_provider, archive_bucket, dest_key)
             with urlopen(Request(signed_url), timeout=60) as response:
                 if response.status != 200:
                     raise ValueError("Archive download did not return HTTP 200")
-                archive_digest = digest(response)
+                archive_digest = digest(response, "verify_archive")
             if source_digest != archive_digest or source_digest[0] != source_meta["ContentLength"]:
                 raise ValueError("Archive contents differ from source; source retained")
             current = source_client.head_object(Bucket=bucket, Key=key)
@@ -748,12 +797,27 @@ def archive_and_delete_objects(
         except Exception as error:
             # Do not persist exception text containing signed URL credentials.
             result["verificationError"] = f"Archive verification failed ({type(error).__name__}); source retained"
-            continue
+            progress("item_done", index, result, completed=mark_done())
+            return
+        progress("deleting", index, result)
         result["deleteAttempted"] = True
-        outcomes = delete_objects([(bucket, key)], resolved_source, batch_size=1)
+        try:
+            outcomes = delete_objects([(bucket, key)], resolved_source, batch_size=1)
+        except Exception as error:
+            result["deleteError"] = f"Deletion failed ({type(error).__name__})"
+            progress("item_done", index, result, completed=mark_done())
+            return
         outcome = outcomes[0]
         result["deleteSuccess"] = outcome["success"]
         result["deleteError"] = outcome.get("error")
+        done = mark_done()
+        progress("item_done", index, result, completed=done)
         if on_delete_progress:
-            on_delete_progress(index + 1, len(merged), bucket, outcomes)
+            on_delete_progress(done, len(merged), bucket, outcomes)
+
+    if merged:
+        workers = min(concurrency or _COPY_CONCURRENCY, len(merged))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            list(pool.map(verify_and_delete_one, range(len(merged))))
+
     return merged

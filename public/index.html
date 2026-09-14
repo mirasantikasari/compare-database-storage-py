@@ -575,7 +575,7 @@
     const res = await fetch(url, opts);
     const body = await res.json().catch(() => ({}));
     if (!res.ok || body.status === false) {
-      throw new Error(body.message || `Request failed (${res.status})`);
+      throw new Error(body.message || body.detail || `Request failed (${res.status})`);
     }
     return body;
   }
@@ -614,7 +614,7 @@
     const res = await raceIdleTimeout(fetch(url, { ...opts, signal: controller.signal }), controller);
     if (!res.ok || !res.body) {
       const body = await res.json().catch(() => ({}));
-      throw new Error(body.message || `Request failed (${res.status})`);
+      throw new Error(body.message || body.detail || `Request failed (${res.status})`);
     }
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
@@ -1917,7 +1917,7 @@
 
   function updateDeleteState() {
     const confirmed = deleteConfirmInput.value.trim() === DELETE_CONFIRM_PHRASE;
-    deleteRunBtn.disabled = !(deleteRows.length > 0 && confirmed && deleteSourceProviderSelect.value);
+    deleteRunBtn.disabled = archiveRunning || !((deleteRows.length > 0 || archiveJobId) && confirmed && deleteSourceProviderSelect.value);
   }
 
   deleteConfirmInput.addEventListener("input", updateDeleteState);
@@ -1934,6 +1934,12 @@
     deleteResult.textContent = "";
     deleteConfirmInput.value = "";
     deleteRows = [];
+    retryArchiveBtn.hidden = true;
+    archiveJobId = null;
+    archiveJobItems = null;
+    activityRows.clear();
+    archiveActivity.replaceChildren();
+    deleteProgressWrap.style.display = "none";
 
     try {
       const formData = new FormData();
@@ -1964,25 +1970,62 @@
   const deleteProgressBar = document.getElementById("deleteProgressBar");
   const deleteProgressLabel = document.getElementById("deleteProgressLabel");
 
+  const retryArchiveBtn = document.createElement('button');
+  retryArchiveBtn.textContent = 'Lanjutkan yang gagal / belum selesai';
+  retryArchiveBtn.hidden = true;
+  deleteResult.after(retryArchiveBtn);
+  const archiveCounters = document.createElement('div');
+  const archiveActivity = document.createElement('div');
+  archiveActivity.style.cssText = 'max-height:280px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;margin-top:8px';
+  deleteProgressWrap.append(archiveCounters, archiveActivity);
+  let archiveRunning = false;
+  let archiveJobId = null;
+  let archiveJobItems = null;
+  const activityRows = new Map();
+  function activity(key, message) {
+    let row = activityRows.get(key);
+    if (!row) {
+      row = document.createElement('div');
+      archiveActivity.append(row);
+      activityRows.set(key, row);
+    }
+    row.textContent = message;
+  }
+  retryArchiveBtn.addEventListener('click', () => deleteRunBtn.click());
+
   deleteRunBtn.addEventListener("click", async () => {
+    if (archiveRunning) return;
     const sourceProvider = deleteSourceProviderSelect.value;
-    const items = deleteRows.map((row) => ({ bucket: row.bucket, key: row.key, path: row.path, sizeMb: row.sizeMb }));
+    const items = archiveJobId && archiveJobItems ? archiveJobItems : deleteRows.map((row) => ({ bucket: row.bucket, key: row.key, path: row.path, sizeMb: row.sizeMb }));
 
     if (!sourceProvider) {
       deleteResult.textContent = "Select the source provider first.";
       deleteResult.className = "msg err";
       return;
     }
-    if (!confirm(`Archive ${items.length} file(s) from ${sourceProvider} to scola-school-archives, with private presigned download links? Only originals with verified archive downloads will be deleted.`)) return;
+    if (!archiveJobId && !confirm(`Archive ${items.length} file(s) from ${sourceProvider} to scola-school-archives, with private presigned download links? Only originals with verified archive downloads will be deleted.`)) return;
 
+    archiveJobItems = items;
+    archiveRunning = true;
+    retryArchiveBtn.hidden = true;
+    retryArchiveBtn.disabled = true;
+    deleteFileInput.disabled = true;
+    deleteSourceProviderSelect.disabled = true;
+    deleteConfirmInput.disabled = true;
+    let copied = 0, skipped = 0, copyErrors = 0, verified = 0, deleted = 0, failed = 0;
+    function counters() {
+      archiveCounters.textContent = `Percobaan ini: ${items.length} file | Disalin: ${copied} | Sudah ada (skip): ${skipped} | Gagal salin: ${copyErrors} | Terverifikasi: ${verified} | Terhapus: ${deleted} | Gagal verifikasi/hapus: ${failed} | Sisa: ${deleteRows.length}`;
+    }
+    counters();
     deleteRunBtn.disabled = true;
     deleteResult.textContent = "";
     deleteProgressWrap.style.display = "block";
     deleteProgressBar.style.width = "0%";
     deleteProgressLabel.textContent = `Archiving 0 / ${items.length} (0%)`;
 
+    let receivedDone = false;
     try {
-      const payload = { items, confirm: deleteConfirmInput.value.trim(), provider: sourceProvider };
+      const payload = { items, confirm: deleteConfirmInput.value.trim(), provider: sourceProvider, archiveJobId };
 
       await fetchSse(
         "/storage/delete/stream",
@@ -1992,15 +2035,53 @@
           body: JSON.stringify(payload),
         },
         {
-          copy_progress: (d) => {
-            deleteProgressBar.style.width = `${d.percent / 2}%`;
-            deleteProgressLabel.textContent = `Archiving ${d.completed} / ${d.total} (${d.percent}%)${d.success ? "" : ` - failed: ${d.key}`}`;
+          archive_failed: () => { archiveJobId = null; },
+          archive_job: (d) => {
+            archiveJobId = d.jobId;
+            deleteProgressLabel.textContent = `Terhubung ke proses ${d.jobId.slice(0, 8)}. Memulihkan progres...`;
           },
-          delete_progress: (d) => {
-            deleteProgressBar.style.width = `${50 + d.percent / 2}%`;
-            deleteProgressLabel.textContent = `Verifying archives and deleting confirmed sources: ${d.completed} / ${d.total}`;
+          copy_progress: (d) => {
+            if (!d.success) copyErrors++;
+            else if (d.skipped) skipped++;
+            else copied++;
+            deleteProgressBar.style.width = `${d.percent / 2}%`;
+            deleteProgressLabel.textContent = `Arsip ${d.completed} / ${d.total} (${d.percent}%) - ${d.key}`;
+            activity('copy:' + d.key, `${d.success ? (d.skipped ? 'SKIP: sudah ada di arsip' : 'SALIN SELESAI') : 'GAGAL SALIN'} | ${d.key}`);
+            counters();
+          },
+          archive_bytes: (d) => {
+            const percent = d.totalBytes ? Math.min(100, d.transferred / d.totalBytes * 100).toFixed(1) : 0;
+            activity('copy:' + d.key, `MENYALIN ${percent}% (${formatBytes(d.transferred)} / ${formatBytes(d.totalBytes)}) | ${d.key}`);
+          },
+          archive_progress: (d) => {
+            const labels = {checking: 'Cek metadata', verify_source: 'Baca & hash sumber', verify_archive: 'Unduh link & hash arsip', deleting: 'Hapus sumber terverifikasi'};
+            const key = d.bucket + '/' + d.key;
+            deleteProgressBar.style.width = `${50 + (d.total ? d.completed / d.total * 49 : 0)}%`;
+            if (d.phase === 'item_done') {
+              const r = d.result;
+              if (r.archiveVerified) verified++;
+              if (r.deleteSuccess) {
+                deleted++;
+                deleteRows = deleteRows.filter(row => !(row.bucket === r.bucket && row.key === r.key));
+              } else if (r.copySuccess) failed++;
+              activity('verify:' + key, `${r.deleteSuccess ? 'TERHAPUS' : 'SUMBER DIPERTAHANKAN'} | ${key} | ${r.verificationError || r.deleteError || r.copyError || 'Verifikasi selesai'}`);
+              deleteProgressLabel.textContent = `Verifikasi & hapus: ${d.completed} / ${d.total} selesai`;
+              counters();
+            } else {
+              const bytes = d.totalBytes ? ` - ${(d.transferred / d.totalBytes * 100).toFixed(1)}% (${formatBytes(d.transferred)} / ${formatBytes(d.totalBytes)})` : '';
+              deleteProgressLabel.textContent = `${labels[d.phase] || d.phase}: ${d.completed + 1} / ${d.total}${bytes}`;
+              activity('verify:' + key, `${labels[d.phase] || d.phase}${bytes} | ${key}`);
+            }
+          },
+          archive_phase: (d) => {
+            deleteProgressLabel.textContent = d.message;
+            if (d.phase === 'report') deleteProgressBar.style.width = '99%';
           },
           done: (d) => {
+            receivedDone = true;
+            archiveJobId = null;
+            deleteProgressBar.style.width = "100%";
+            deleteProgressLabel.textContent = "Percobaan selesai. Lihat hasil dan file yang perlu dilanjutkan di bawah.";
             const { deletedCount, copyFailedCount, archivedNotDeletedCount, auditFile, reportFile, archiveBucketPolicyError } = d;
             if (!archiveBucketPolicyError) {
               deleteRows = deleteRows.filter((row) => !d.results.some(
@@ -2030,11 +2111,19 @@
           },
         },
       );
+      if (!receivedDone) throw new Error("Koneksi progres terputus. File yang belum terkonfirmasi tetap dalam daftar. Klik Sambungkan progres untuk mengikuti proses yang sama.");
     } catch (err) {
       deleteResult.textContent = err.message;
       deleteResult.className = "msg err";
     } finally {
-      deleteProgressWrap.style.display = "none";
+      archiveRunning = false;
+      deleteFileInput.disabled = false;
+      deleteSourceProviderSelect.disabled = false;
+      deleteConfirmInput.disabled = false;
+      retryArchiveBtn.hidden = deleteRows.length === 0 && !archiveJobId;
+      retryArchiveBtn.disabled = false;
+      retryArchiveBtn.textContent = archiveJobId ? "Sambungkan progres proses aktif" : `Lanjutkan ${deleteRows.length} file gagal / belum selesai`;
+      counters();
       updateDeleteState();
     }
   });
