@@ -39,6 +39,28 @@ class ArchiveJobTests(unittest.TestCase):
         finally:
             release.set()
 
+    def test_independent_reports_run_concurrently(self):
+        jobs = ArchiveJobs()
+        release_one = threading.Event()
+        release_two = threading.Event()
+        job_one = jobs.connect("one", [("b", "k1")], lambda emit: release_one.wait(2))
+        job_two = jobs.connect("two", [("b", "k2")], lambda emit: release_two.wait(2))
+        try:
+            self.assertNotEqual(job_one["id"], job_two["id"])
+        finally:
+            release_one.set()
+            release_two.set()
+
+    def test_overlapping_keys_cannot_start_new_job(self):
+        jobs = ArchiveJobs()
+        release = threading.Event()
+        jobs.connect("one", [("b", "k")], lambda emit: release.wait(2))
+        try:
+            with self.assertRaises(ValueError):
+                jobs.connect("two", [("b", "k")], lambda emit: None)
+        finally:
+            release.set()
+
     def test_failed_job_emits_terminal_failure(self):
         jobs = ArchiveJobs()
         def work(emit):

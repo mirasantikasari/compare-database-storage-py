@@ -1,4 +1,8 @@
-"""Reconnectable archive streams. Workers live independently of HTTP connections."""
+"""Reconnectable archive streams. Workers live independently of HTTP connections.
+
+Jobs targeting disjoint object keys run concurrently (different tabs/devices can each drive
+their own report's deletion at the same time); only overlapping keys are serialized, since
+deleting the same object from two jobs at once would race."""
 import asyncio
 import threading
 import uuid
@@ -21,10 +25,11 @@ class ArchiveJobs:
                     raise ValueError("Report/provider berbeda dari proses yang ingin disambungkan.")
                 return job
             for job in self.jobs.values():
-                if not job["finished"]:
-                    if job["provider"] == provider and keys.issubset(job["keys"]):
-                        return job
-                    raise ValueError("Proses arsip untuk report/provider lain masih berjalan.")
+                if not job["finished"] and job["provider"] == provider and keys.issubset(job["keys"]):
+                    return job
+            for job in self.jobs.values():
+                if not job["finished"] and keys & job["keys"]:
+                    raise ValueError("Sebagian file pada report ini sedang diproses di proses arsip lain.")
             # Retain recent completed jobs for reconnect after the terminal event was lost.
             if len(self.jobs) >= 8:
                 self.jobs.pop(next(iter(self.jobs)))

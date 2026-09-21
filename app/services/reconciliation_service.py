@@ -102,7 +102,7 @@ def _split_s3_style_url(pathname: str, host: str) -> tuple[str, str, str | None]
     """
     Best-effort split of an S3-style URL's (host, path) into (bucket, key, provider_hint). Tries
     every configured provider's endpoint first — respecting its actual path-style vs
-    virtual-hosted setting, the same distinction build_object_url uses — then falls back to AWS's
+    virtual-hosted setting, the same distinction build_object_presigned_url uses — then falls back to AWS's
     well-known *.amazonaws.com pattern even when AWS isn't a configured provider here, since DB
     columns often keep old or foreign references to buckets this app was never given credentials
     for. provider_hint is that matched provider's key (e.g. "do-sfo2"), or the literal "aws" for the

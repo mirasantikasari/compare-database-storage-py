@@ -14,7 +14,7 @@ from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.worksheet import Worksheet
 
 from app.config import env
-from app.providers.s3_provider import build_object_url, build_archive_presigned_url, ARCHIVE_URL_TTL_SECONDS
+from app.providers.s3_provider import build_object_presigned_url, build_archive_presigned_url, ARCHIVE_URL_TTL_SECONDS
 from app.services.reconciliation_service import _split_object_reference
 from app.types import DoCleanupResult, ReconciliationResult, StorageObject, StorageSummary
 
@@ -195,7 +195,7 @@ def generate_bucket_objects_report(
     started_at = time.monotonic()
     for written, obj in enumerate(objects, start=1):
         total_size += obj.size
-        url = build_object_url(provider, bucket, obj.key)
+        url = build_object_presigned_url(provider, bucket, obj.key)
         sheet.append([obj.key, _mb(obj.size), _naive(obj.last_modified), _hyperlink_cell(sheet, url)])
 
         if on_progress and written % _REPORT_TICK_EVERY_ROWS == 0:
@@ -232,7 +232,7 @@ def generate_copy_report(
     {sourcePath, bucket, key, destBucket, sizeMb, table, column, rowId, status, error} where status is "Copied"
     (freshly transferred), "Skipped" (already existed at the destination — see copy_objects'
     overwrite=False default), or "Failed". The Destination URL column is built the same way
-    every other report's clickable link is (build_object_url) and is shown even for a Failed row
+    every other report's clickable link is (build_object_presigned_url) and is shown even for a Failed row
     (where it points at where the object would be) so a reviewer can immediately tell the two
     providers' copies apart without reconstructing the URL by hand.
 
@@ -263,7 +263,7 @@ def generate_copy_report(
         status = entry["status"]
         status_counts[status] = status_counts.get(status, 0) + 1
 
-        dest_url = build_object_url(dest_provider, entry["destBucket"], entry["key"]) if entry.get("destBucket") else None
+        dest_url = build_object_presigned_url(dest_provider, entry["destBucket"], entry["key"]) if entry.get("destBucket") else None
         row_idx = sheet.max_row + 1
         sheet.append(
             [
@@ -635,7 +635,7 @@ def generate_reconciliation_report(
         )
     )
     for file in result.matched:
-        fallback_url = build_object_url(provider, file.bucket, file.path)
+        fallback_url = build_object_presigned_url(provider, file.bucket, file.path)
         matched_sheet.append(
             [
                 _raw_value_cell(matched_sheet, file.raw_value, fallback_url),
@@ -658,7 +658,7 @@ def generate_reconciliation_report(
         # build one at all) points at where it *would* be — it will 404, but that's still more
         # useful for tracking it down than a bare relative key. The displayed text is always the
         # raw DB value regardless — never a URL rebuilt from the parsed bucket/key.
-        fallback_url = build_object_url(provider, file.bucket, file.path) if file.bucket else None
+        fallback_url = build_object_presigned_url(provider, file.bucket, file.path) if file.bucket else None
         missing_sheet.append(
             [_raw_value_cell(missing_sheet, file.raw_value, fallback_url), file.table, file.column, file.id]
         )
@@ -674,7 +674,7 @@ def generate_reconciliation_report(
     orphan_sheet.column_dimensions[get_column_letter(5)].hidden = True
     orphan_sheet.append(_header_row(orphan_sheet, ["Path", "Size (MB)", "Last Modified", "Bucket", "Key"]))
     for file in result.orphan:
-        url = build_object_url(provider, file.bucket, file.path)
+        url = build_object_presigned_url(provider, file.bucket, file.path)
         orphan_sheet.append(
             [
                 _hyperlink_cell(orphan_sheet, url),
@@ -696,7 +696,7 @@ def generate_reconciliation_report(
         protected_sheet.column_dimensions[get_column_letter(idx)].width = width
     protected_sheet.append(_header_row(protected_sheet, ["Path", "Bucket", "Size (MB)", "Last Modified"]))
     for file in result.protected:
-        url = build_object_url(provider, file.bucket, file.path)
+        url = build_object_presigned_url(provider, file.bucket, file.path)
         protected_sheet.append(
             [_hyperlink_cell(protected_sheet, url), file.bucket, _mb(file.size), _naive(file.last_modified)]
         )
@@ -776,7 +776,7 @@ def generate_do_cleanup_report(
     candidates_sheet.column_dimensions[get_column_letter(5)].hidden = True
     candidates_sheet.append(_header_row(candidates_sheet, ["Path", "Bucket", "Size (MB)", "Last Modified", "Key"]))
     for file in result.candidates:
-        url = build_object_url(provider, file.bucket, file.path)
+        url = build_object_presigned_url(provider, file.bucket, file.path)
         candidates_sheet.append(
             [_hyperlink_cell(candidates_sheet, url), file.bucket, _mb(file.size), _naive(file.last_modified), file.path]
         )
@@ -787,7 +787,7 @@ def generate_do_cleanup_report(
         protected_sheet.column_dimensions[get_column_letter(idx)].width = width
     protected_sheet.append(_header_row(protected_sheet, ["Path", "Bucket", "Size (MB)", "Last Modified"]))
     for file in result.protected:
-        url = build_object_url(provider, file.bucket, file.path)
+        url = build_object_presigned_url(provider, file.bucket, file.path)
         protected_sheet.append(
             [_hyperlink_cell(protected_sheet, url), file.bucket, _mb(file.size), _naive(file.last_modified)]
         )

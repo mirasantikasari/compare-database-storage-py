@@ -56,7 +56,8 @@ def get_s3_client(provider_key: str | None = None):
 
 def build_bucket_url(provider_key: str | None, bucket: str) -> str:
     """Base URL for a bucket itself (path-style or virtual-hosted, per the provider's config),
-    with no trailing slash — the same addressing rules as build_object_url, minus an object key."""
+    with no trailing slash — the same addressing rules as build_object_presigned_url, minus an
+    object key (and minus a signature, since there's no single object to sign)."""
     resolved_key = provider_key or env.s3_default_provider_key
     config = env.s3_providers.get(resolved_key) if resolved_key else None
 
@@ -77,35 +78,22 @@ def build_bucket_url(provider_key: str | None, bucket: str) -> str:
     return f"https://{bucket}.{host}"
 
 
-def build_object_url(provider_key: str | None, bucket: str, key: str) -> str:
-    """Full public object URL (path-style or virtual-hosted, per the provider's config)."""
-    resolved_key = provider_key or env.s3_default_provider_key
-    config = env.s3_providers.get(resolved_key) if resolved_key else None
-    encoded_key = "/".join(quote(part) for part in key.split("/"))
+OBJECT_URL_TTL_SECONDS = 7 * 24 * 60 * 60
 
-    if config is None:
-        return f"{bucket}/{encoded_key}"
 
-    if config.endpoint:
-        parts = urlsplit(config.endpoint)
-        if config.force_path_style:
-            return f"{parts.scheme}://{parts.netloc}/{bucket}/{encoded_key}"
-        return f"{parts.scheme}://{bucket}.{parts.netloc}/{encoded_key}"
-
-    host = (
-        "s3.amazonaws.com"
-        if config.region == "us-east-1"
-        else f"s3.{config.region}.amazonaws.com"
+def build_object_presigned_url(
+    provider_key: str | None, bucket: str, key: str, expires_in: int = OBJECT_URL_TTL_SECONDS
+) -> str:
+    """Sign a private object download link so it still opens when the bucket/object isn't public."""
+    return get_s3_client(provider_key).generate_presigned_url(
+        "get_object", Params={"Bucket": bucket, "Key": key},
+        ExpiresIn=expires_in, HttpMethod="GET",
     )
-    return f"https://{bucket}.{host}/{encoded_key}"
 
 
-ARCHIVE_URL_TTL_SECONDS = 7 * 24 * 60 * 60
+ARCHIVE_URL_TTL_SECONDS = OBJECT_URL_TTL_SECONDS
 
 
 def build_archive_presigned_url(provider_key: str | None, bucket: str, key: str) -> str:
     """Sign a private archive download for seven days without fetching its contents."""
-    return get_s3_client(provider_key).generate_presigned_url(
-        "get_object", Params={"Bucket": bucket, "Key": key},
-        ExpiresIn=ARCHIVE_URL_TTL_SECONDS, HttpMethod="GET",
-    )
+    return build_object_presigned_url(provider_key, bucket, key, expires_in=ARCHIVE_URL_TTL_SECONDS)
