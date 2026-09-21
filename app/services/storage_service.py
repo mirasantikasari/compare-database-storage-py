@@ -657,17 +657,24 @@ def ensure_public_read_bucket_policy(provider: str, bucket: str) -> str | None:
 
 
 _archive_run_lock = threading.Lock()
+_archive_active_keys: set[tuple[str, str]] = set()
 
 
 def _single_archive_run(function):
+    """Serialize archive runs only where they'd touch the same objects — independent reports
+    (disjoint bucket/key pairs) run concurrently; only an overlapping run is rejected."""
     @wraps(function)
-    def guarded(*args, **kwargs):
-        if not _archive_run_lock.acquire(blocking=False):
-            raise RuntimeError("An archive run is still active. Wait for it to finish before continuing.")
+    def guarded(items, *args, **kwargs):
+        keys = frozenset(items)
+        with _archive_run_lock:
+            if keys & _archive_active_keys:
+                raise RuntimeError("An archive run is still active. Wait for it to finish before continuing.")
+            _archive_active_keys.update(keys)
         try:
-            return function(*args, **kwargs)
+            return function(items, *args, **kwargs)
         finally:
-            _archive_run_lock.release()
+            with _archive_run_lock:
+                _archive_active_keys.difference_update(keys)
     return guarded
 
 

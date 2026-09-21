@@ -140,13 +140,23 @@ class VerifiedDeletionTests(unittest.TestCase):
         self.assertEqual(self.events[-1]["phase"], "item_done")
         self.assertFalse(self.events[-1]["result"]["deleteAttempted"])
 
-    def test_concurrent_archive_rejected(self):
-        storage._archive_run_lock.acquire()
+    def test_concurrent_overlapping_archive_rejected(self):
+        storage._archive_active_keys.add(("school", "file"))
         try:
             with self.assertRaisesRegex(RuntimeError, "still active"):
-                storage.archive_and_delete_objects([], "source", "archive", "scola-school-archives")
+                storage.archive_and_delete_objects([("school", "file")], "source", "archive", "scola-school-archives")
         finally:
-            storage._archive_run_lock.release()
+            storage._archive_active_keys.discard(("school", "file"))
+
+    def test_concurrent_independent_archive_allowed(self):
+        storage._archive_active_keys.add(("school", "other-file"))
+        try:
+            with self.assertRaises(ValueError):
+                # Disjoint keys aren't blocked by the active run above; this still fails, but for
+                # the unrelated reason that "other" isn't the required archive bucket.
+                storage.archive_and_delete_objects([("school", "file")], "source", "archive", "other")
+        finally:
+            storage._archive_active_keys.discard(("school", "other-file"))
 
 
 class ArchiveCopySkipTests(unittest.TestCase):
