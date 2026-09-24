@@ -314,6 +314,93 @@ def generate_copy_report(
     return _save_workbook(workbook, file_name)
 
 
+def generate_restore_report(
+    entries: list[dict],
+    dest_provider: str | None,
+    file_name: str | None = None,
+    on_progress: ReportProgressCallback | None = None,
+) -> str:
+    """
+    One row per item a /storage/restore-from-archive(/stream) run was asked to handle — the
+    reverse of generate_copy_report's "Copied" report: each entry is {archiveBucket, archiveKey,
+    destBucket, destKey, sizeMb, table, column, rowId, status, error}. Unlike a plain cross-provider
+    copy, the destination key here is never the same as the source key (the archive key is
+    "<original bucket>/<original key>"; the restored object drops that leading bucket segment), so
+    the Destination URL is built from destBucket/destKey specifically rather than reusing the
+    source key the way generate_copy_report does. Sheet name is "Restored", not "Copied", so this
+    report is never mistaken for a plain migration report by the parsers that look for that sheet.
+    """
+    file_name = file_name or build_report_file_name(["restore"])
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Restored"
+
+    headers = [
+        "Archive Bucket", "Archive Key", "Destination URL", "Size (MB)",
+        "Table", "Column", "Row ID", "Status", "Error",
+    ]
+    sheet.append(headers)
+    widths = [22, 55, 55, 12, 24, 24, 16, 12, 30]
+    for idx, width in enumerate(widths, start=1):
+        sheet.column_dimensions[sheet.cell(row=1, column=idx).column_letter].width = width
+
+    total = len(entries)
+    started_at = time.monotonic()
+    status_counts: dict[str, int] = {}
+    for written, entry in enumerate(entries, start=1):
+        status = entry["status"]
+        status_counts[status] = status_counts.get(status, 0) + 1
+
+        dest_url = (
+            build_object_presigned_url(dest_provider, entry["destBucket"], entry["destKey"])
+            if entry.get("destBucket") and entry.get("destKey")
+            else None
+        )
+        row_idx = sheet.max_row + 1
+        sheet.append(
+            [
+                entry["archiveBucket"],
+                entry["archiveKey"],
+                dest_url or "",
+                entry.get("sizeMb"),
+                entry.get("table") or "",
+                entry.get("column") or "",
+                entry.get("rowId") if entry.get("rowId") is not None else "",
+                status,
+                entry.get("error") or "",
+            ]
+        )
+        if dest_url:
+            cell = sheet.cell(row=row_idx, column=3)
+            cell.hyperlink = dest_url
+            cell.font = _HYPERLINK_FONT
+        if status == "Failed":
+            sheet.cell(row=row_idx, column=8).font = _RED
+
+        if on_progress and written % _REPORT_TICK_EVERY_ROWS == 0:
+            elapsed = max(time.monotonic() - started_at, 0.001)
+            on_progress(
+                "report", written, total,
+                f"Writing report — {written:,}/{total:,} row(s) ({written / elapsed:,.0f}/s)",
+                None,
+            )
+
+    _style_header_row(sheet)
+
+    summary_sheet = workbook.create_sheet("Summary")
+    summary_sheet.append(["Status", "Count"])
+    for status, count in status_counts.items():
+        summary_sheet.append([status, count])
+    _style_header_row(summary_sheet)
+    for idx, width in enumerate([16, 10], start=1):
+        summary_sheet.column_dimensions[get_column_letter(idx)].width = width
+
+    if on_progress:
+        on_progress("report", total, total, "Saving workbook to disk…", None)
+
+    return _save_workbook(workbook, file_name)
+
+
 def parse_copy_report_for_db_update(file_obj) -> tuple[list[dict], dict[str, int]]:
     """
     Reads a generated migration report and returns only successfully available destination URLs.
@@ -1010,3 +1097,67 @@ def parse_matched_report(file_obj) -> list[dict]:
             }
         )
     return results
+
+
+_BUCKET_OBJECTS_SHEET_NAME = "Objects"
+
+
+def parse_bucket_objects_report(file_obj) -> tuple[str, list[dict]]:
+    """
+    Reads a previously-downloaded "List bucket objects" report (generate_bucket_objects_report)
+    back in. Meant for restoring from the archive bucket: list "scola-school-archives" itself via
+    "List bucket objects", download the report, optionally trim it down to the rows actually
+    wanted, and re-upload it here — each Key is already in the archive convention
+    "<original bucket>/<original key>" (see storage_service._archive_dest_key), so unlike
+    parse_matched_report there's no path/URL to re-derive it from. The bucket the report was
+    listed against comes from its "Summary" sheet, not from the caller, so the returned items are
+    only ever the ones actually seen in that bucket. Raises ValueError on anything that doesn't
+    look like a bucket-objects report.
+    """
+    try:
+        workbook = load_workbook(file_obj, read_only=True, data_only=True)
+    except Exception as error:  # noqa: BLE001 - openpyxl raises its own zip/XML errors for anything not a real .xlsx
+        raise ValueError(f"Not a valid .xlsx file: {error}") from error
+
+    if _BUCKET_OBJECTS_SHEET_NAME not in workbook.sheetnames:
+        raise ValueError(
+            f"No '{_BUCKET_OBJECTS_SHEET_NAME}' sheet found in the uploaded file — upload a report "
+            "downloaded from \"List bucket objects\"."
+        )
+
+    bucket = None
+    if "Summary" in workbook.sheetnames:
+        for row in workbook["Summary"].iter_rows(values_only=True):
+            if row and str(row[0]).strip().lower() == "bucket" and len(row) > 1:
+                bucket = str(row[1]).strip() if row[1] is not None else None
+                break
+    if not bucket:
+        raise ValueError("Could not find the source bucket in the report's 'Summary' sheet")
+
+    ws = workbook[_BUCKET_OBJECTS_SHEET_NAME]
+    rows_iter = ws.iter_rows(values_only=True)
+    header = next(rows_iter, None)
+    if not header:
+        return bucket, []
+    col_index = {str(name).strip().lower(): i for i, name in enumerate(header) if name is not None}
+    if "key" not in col_index:
+        raise ValueError(f"'{_BUCKET_OBJECTS_SHEET_NAME}' sheet is missing expected column: key")
+
+    def cell_value(row, column_name: str):
+        """Return None when an edited/blank Excel row ends before the requested column."""
+        index = col_index.get(column_name)
+        return row[index] if index is not None and index < len(row) else None
+
+    results = []
+    for row in rows_iter:
+        key = cell_value(row, "key")
+        if not key:
+            continue
+        results.append(
+            {
+                "key": str(key),
+                "sizeMb": cell_value(row, "size (mb)"),
+                "url": cell_value(row, "url"),
+            }
+        )
+    return bucket, results

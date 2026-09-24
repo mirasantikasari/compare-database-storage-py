@@ -367,8 +367,10 @@
       is skipped instead of re-copied, unless "overwrite" below is checked. The destination bucket
       is created automatically if it doesn't exist yet, and copied files default to publicly
       readable (a plain object copy doesn't carry the source's ACL over, so without this a file
-      that used to be public silently becomes private and every link to it breaks). Produces a
-      downloadable .xlsx report with every file's new destination link.
+      that used to be public silently becomes private and every link to it breaks). Source and
+      destination provider can also be the same (e.g. moving between two buckets on the same
+      account) — a destination bucket is then required, and it must differ from every source
+      bucket. Produces a downloadable .xlsx report with every file's new destination link.
     </p>
     <div class="row">
       <div>
@@ -384,7 +386,7 @@
         <select id="copyDestProvider"><option value="">Loading…</option></select>
       </div>
       <div>
-        <label>Destination bucket (optional)</label><br />
+        <label>Destination bucket (required if same provider)</label><br />
         <input type="text" id="copyDestBucket" placeholder="same as source" size="20" />
       </div>
     </div>
@@ -408,6 +410,64 @@
       </div>
     </div>
     <div id="copyResult" class="msg" style="margin-top:12px;"></div>
+  </section>
+
+  <section class="card">
+    <h2>Restore files from archive</h2>
+    <p class="hint">
+      Paste one or more archive URLs (or bare "&lt;archive bucket&gt;/&lt;original bucket&gt;/&lt;original key&gt;"
+      paths), one per line — e.g.
+      <code>https://sgp1.digitaloceanspaces.com/scola-school-archives/scola-rosetta/s3_ckf_files/files/foo.mp3</code>
+      restores to <code>https://sgp1.digitaloceanspaces.com/scola-rosetta/s3_ckf_files/files/foo.mp3</code>
+      (the archive bucket segment is dropped; everything after it becomes the destination bucket +
+      key). Same non-destructive behavior as "Copy files to another provider" above — nothing is
+      deleted from the archive, and re-running with overlapping lines skips anything already at
+      the destination unless "overwrite" is checked. Produces a downloadable .xlsx report.
+    </p>
+    <div class="row">
+      <div style="flex:1 1 100%;">
+        <label>Archive URLs / paths (one per line)</label><br />
+        <textarea id="restoreLines" rows="5" style="width:100%; resize:vertical;" placeholder="https://sgp1.digitaloceanspaces.com/scola-school-archives/scola-rosetta/s3_ckf_files/files/foo.mp3"></textarea>
+      </div>
+    </div>
+    <div class="row">
+      <div style="flex:1 1 100%;">
+        <label>…or upload a "List bucket objects" report of the archive bucket (.xlsx)</label><br />
+        <input type="file" id="restoreFileInput" accept=".xlsx" />
+        <span class="hint" style="display:block; margin-top:4px;">
+          Trim the report down to just the rows you want first if you don't want everything in it restored.
+          If a file is selected, it's used instead of the pasted lines above.
+        </span>
+      </div>
+    </div>
+    <div class="row">
+      <div>
+        <label>Source provider (where the archive lives)</label><br />
+        <select id="restoreSourceProvider"><option value="">Loading…</option></select>
+      </div>
+      <div>
+        <label>Destination provider</label><br />
+        <select id="restoreDestProvider"><option value="">Loading…</option></select>
+      </div>
+      <div style="align-self:flex-end;">
+        <label><input type="checkbox" id="restoreOverwrite" /> overwrite files that already exist at the destination</label>
+      </div>
+      <div style="align-self:flex-end;">
+        <label><input type="checkbox" id="restoreMakePublic" checked /> make restored files publicly readable (ACL: public-read)</label>
+      </div>
+      <button id="restoreRunBtn" style="align-self:flex-end;">Restore files</button>
+      <button id="restoreRetryBtn" style="align-self:flex-end; display:none;">Retry — continue remaining</button>
+    </div>
+    <div id="restoreMsg" class="msg"></div>
+    <div id="restoreProgressWrap" style="display:none; margin-top:12px;">
+      <div class="progress-track"><div id="restoreProgressBar" class="progress-fill"></div></div>
+      <div id="restoreProgressLabel" class="loading"></div>
+      <div id="restoreItemProgressWrap" style="margin-top:10px; display:none;">
+        <div class="progress-track" style="height:14px;"><div id="restoreItemProgressBar" class="progress-fill active-stripe"></div></div>
+        <div id="restoreItemProgressLabel" class="loading" style="font-weight:600; margin-top:4px;"></div>
+      </div>
+    </div>
+    <div id="restoreResult" class="msg" style="margin-top:12px;"></div>
   </section>
 
   <section class="card" style="border-color:var(--warn);">
@@ -689,6 +749,8 @@
         .join("");
       populateProviderSelect(document.getElementById("copySourceProvider"), { preselectKey: "do-sfo2", fallbackIndex: 0 });
       populateProviderSelect(document.getElementById("copyDestProvider"), { preselectKey: "wasabi", fallbackIndex: cachedProviders.length > 1 ? 1 : 0 });
+      populateProviderSelect(document.getElementById("restoreSourceProvider"), { preselectKey: "do-sgp1", fallbackIndex: 0 });
+      populateProviderSelect(document.getElementById("restoreDestProvider"), { preselectKey: "do-sgp1", fallbackIndex: 0 });
       populateProviderSelect(document.getElementById("migDeleteSourceProvider"), { preselectKey: "do", fallbackIndex: 0 });
       populateProviderSelect(document.getElementById("excludedDeleteSourceProvider"), { preselectKey: "do", fallbackIndex: 0 });
       populateProviderSelect(document.getElementById("deleteSourceProvider"), { preselectKey: "do", fallbackIndex: 0 });
@@ -1258,8 +1320,9 @@
       copyMsg.className = "msg err";
       return;
     }
-    if (sourceProvider === destProvider) {
-      copyMsg.textContent = "Source and destination provider must be different.";
+    const destBucket = copyDestBucket.value.trim();
+    if (sourceProvider === destProvider && !destBucket) {
+      copyMsg.textContent = "Source and destination provider are the same — set a destination bucket to copy into.";
       copyMsg.className = "msg err";
       return;
     }
@@ -1290,12 +1353,19 @@
       return;
     }
 
+    if (sourceProvider === destProvider && items.some((item) => item.bucket === destBucket)) {
+      copyMsg.textContent = `Destination bucket "${destBucket}" is the same as the source bucket for at least one row — pick a different destination bucket.`;
+      copyMsg.className = "msg err";
+      copyRunBtn.disabled = false;
+      return;
+    }
+
     copyState = {
       allItems: items,
       remaining: items.slice(),
       fileName: file.name,
       sourceProvider, destProvider,
-      destBucket: copyDestBucket.value.trim(),
+      destBucket,
       overwrite: document.getElementById("copyOverwrite").checked,
       makePublic: document.getElementById("copyMakePublic").checked,
       succeededCount: 0, skippedCount: 0, failedCount: 0,
@@ -1310,6 +1380,205 @@
   copyRetryBtn.addEventListener("click", async () => {
     if (!copyState || copyState.remaining.length === 0) return;
     await runCopyAttempt();
+  });
+
+  // --- Restore files from archive ---
+  const restoreLines = document.getElementById("restoreLines");
+  const restoreFileInput = document.getElementById("restoreFileInput");
+  const restoreMsg = document.getElementById("restoreMsg");
+  const restoreSourceProvider = document.getElementById("restoreSourceProvider");
+  const restoreDestProvider = document.getElementById("restoreDestProvider");
+  const restoreRunBtn = document.getElementById("restoreRunBtn");
+  const restoreRetryBtn = document.getElementById("restoreRetryBtn");
+  const restoreProgressWrap = document.getElementById("restoreProgressWrap");
+  const restoreProgressBar = document.getElementById("restoreProgressBar");
+  const restoreProgressLabel = document.getElementById("restoreProgressLabel");
+  const restoreItemProgressWrap = document.getElementById("restoreItemProgressWrap");
+  const restoreItemProgressBar = document.getElementById("restoreItemProgressBar");
+  const restoreItemProgressLabel = document.getElementById("restoreItemProgressLabel");
+  const restoreResult = document.getElementById("restoreResult");
+
+  // Same resume-on-drop shape as copyState (see above).
+  let restoreState = null;
+
+  async function runRestoreAttempt() {
+    const itemsToSend = restoreState.remaining;
+    const total = restoreState.allItems.length;
+
+    restoreRunBtn.disabled = true;
+    restoreRetryBtn.disabled = true;
+    restoreRetryBtn.style.display = "none";
+    restoreResult.textContent = "";
+    restoreResult.className = "msg";
+    restoreMsg.textContent = restoreState.attempts === 0
+      ? `Restoring ${itemsToSend.length} file(s)…`
+      : `Resuming — ${itemsToSend.length} of ${total} file(s) left…`;
+    restoreMsg.className = "msg";
+    restoreState.attempts += 1;
+
+    const doneAtStart = total - itemsToSend.length;
+    restoreProgressWrap.style.display = "block";
+    restoreProgressBar.style.width = `${Math.round((doneAtStart / total) * 100)}%`;
+    restoreProgressLabel.textContent = `${doneAtStart} / ${total} processed`;
+    restoreItemProgressWrap.style.display = "none";
+    restoreItemProgressBar.style.width = "0%";
+    restoreItemProgressLabel.textContent = "";
+
+    const payload = {
+      items: itemsToSend,
+      sourceProvider: restoreState.sourceProvider,
+      destProvider: restoreState.destProvider,
+      overwrite: restoreState.overwrite,
+      makePublic: restoreState.makePublic,
+    };
+
+    try {
+      await fetchSse(
+        "/storage/restore-from-archive/stream",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        },
+        {
+          item_progress: (d) => {
+            restoreItemProgressWrap.style.display = "block";
+            restoreItemProgressBar.style.width = `${d.percent}%`;
+            restoreItemProgressLabel.textContent =
+              `Uploading ${d.key} — ${formatBytes(d.bytesTransferred)} / ${formatBytes(d.totalBytes)} (${d.percent}%)`;
+          },
+          progress: (d) => {
+            const idx = restoreState.remaining.findIndex((it) => it.key === d.key);
+            if (idx !== -1) restoreState.remaining.splice(idx, 1);
+
+            const overallDone = total - restoreState.remaining.length;
+            const percent = Math.round((overallDone / total) * 100);
+            restoreProgressBar.style.width = `${percent}%`;
+            const status = !d.success ? " (failed)" : d.skipped ? " (already at destination, skipped)" : "";
+            restoreProgressLabel.textContent = `${overallDone} / ${total} processed (${percent}%) — ${d.key}${status}`;
+            restoreItemProgressWrap.style.display = "none";
+          },
+          report_progress: (d) => {
+            restoreProgressLabel.textContent = `${total} / ${total} processed (100%) — ${d.message}`;
+            restoreItemProgressWrap.style.display = "block";
+            restoreItemProgressBar.style.width = `${d.percent}%`;
+            restoreItemProgressLabel.textContent =
+              `${d.message} — ${d.completed.toLocaleString()} / ${d.total.toLocaleString()} row(s) (${d.percent}%)`;
+          },
+          done: (d) => {
+            restoreState.succeededCount += d.succeededCount;
+            restoreState.skippedCount += d.skippedCount;
+            restoreState.failedCount += d.failedCount;
+            if (d.auditFile) restoreState.auditFiles.push(d.auditFile);
+            if (d.reportFile) restoreState.reportFiles.push(d.reportFile);
+          },
+        },
+      );
+
+      const { succeededCount, skippedCount, failedCount, auditFiles, reportFiles, destProvider } = restoreState;
+      const restoredCount = succeededCount - skippedCount;
+      restoreMsg.textContent = "";
+      restoreResult.innerHTML =
+        `Restored ${restoredCount} file(s) to ${destProvider}` +
+        `${skippedCount ? `, ${skippedCount} already there (skipped)` : ""}` +
+        `${failedCount ? `, ${failedCount} failed` : ""}. ` +
+        `Audit log${auditFiles.length > 1 ? "s" : ""}: ${auditFiles.join(", ")}` +
+        (reportFiles.length ? ` — ${reportFiles.map(reportLink).join(" ")}` : "");
+      restoreResult.className = failedCount ? "msg err" : "msg ok";
+      restoreProgressWrap.style.display = "none";
+      restoreRetryBtn.style.display = "none";
+      restoreState = null;
+    } catch (err) {
+      const remainingCount = restoreState.remaining.length;
+      restoreMsg.textContent = "";
+      restoreResult.textContent = remainingCount > 0
+        ? `Stopped after an error, ${remainingCount} of ${total} file(s) still left: ${err.message}`
+        : err.message;
+      restoreResult.className = "msg err";
+      if (remainingCount > 0) {
+        restoreRetryBtn.style.display = "inline-block";
+        restoreRetryBtn.disabled = false;
+      }
+    } finally {
+      restoreRunBtn.disabled = false;
+    }
+  }
+
+  restoreRunBtn.addEventListener("click", async () => {
+    const file = restoreFileInput.files[0];
+    const lines = restoreLines.value.split("\n").map((l) => l.trim()).filter(Boolean);
+    const sourceProvider = restoreSourceProvider.value;
+    const destProvider = restoreDestProvider.value;
+
+    restoreResult.textContent = "";
+    restoreResult.className = "msg";
+    restoreRetryBtn.style.display = "none";
+
+    if (!file && lines.length === 0) {
+      restoreMsg.textContent = "Paste at least one archive URL or path, or upload a bucket-objects report, first.";
+      restoreMsg.className = "msg err";
+      return;
+    }
+    if (!sourceProvider || !destProvider) {
+      restoreMsg.textContent = "Pick both a source and destination provider.";
+      restoreMsg.className = "msg err";
+      return;
+    }
+
+    restoreRunBtn.disabled = true;
+    restoreMsg.textContent = file ? "Parsing uploaded report…" : "Parsing archive URLs/paths…";
+    restoreMsg.className = "msg";
+
+    let items;
+    try {
+      let body;
+      if (file) {
+        const formData = new FormData();
+        formData.append("file", file);
+        body = await fetchJson("/storage/parse-bucket-objects-report", { method: "POST", body: formData });
+      } else {
+        body = await fetchJson("/storage/parse-archive-refs", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ lines }),
+        });
+      }
+      items = body.data.rows.map((row) => ({ bucket: row.bucket, key: row.key, path: row.path, sizeMb: row.sizeMb }));
+      if (body.data.errors.length > 0) {
+        restoreMsg.textContent = `${body.data.errors.length} row(s) could not be parsed and were skipped: ` +
+          body.data.errors.map((e) => `"${e.line}" (${e.reason})`).join("; ");
+        restoreMsg.className = "msg err";
+      }
+    } catch (err) {
+      restoreMsg.textContent = err.message;
+      restoreMsg.className = "msg err";
+      restoreRunBtn.disabled = false;
+      return;
+    }
+
+    if (items.length === 0) {
+      restoreMsg.textContent = restoreMsg.textContent || "Nothing to restore.";
+      restoreMsg.className = "msg err";
+      restoreRunBtn.disabled = false;
+      return;
+    }
+
+    restoreState = {
+      allItems: items,
+      remaining: items.slice(),
+      sourceProvider, destProvider,
+      overwrite: document.getElementById("restoreOverwrite").checked,
+      makePublic: document.getElementById("restoreMakePublic").checked,
+      succeededCount: 0, skippedCount: 0, failedCount: 0,
+      auditFiles: [], reportFiles: [],
+      attempts: 0,
+    };
+    await runRestoreAttempt();
+  });
+
+  restoreRetryBtn.addEventListener("click", async () => {
+    if (!restoreState || restoreState.remaining.length === 0) return;
+    await runRestoreAttempt();
   });
 
   // --- Update database URLs from a completed storage migration report ---

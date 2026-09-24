@@ -21,7 +21,9 @@ from app.services.excel_service import (
     generate_bucket_links_report,
     generate_bucket_objects_report,
     generate_copy_report,
+    generate_restore_report,
     generate_storage_report,
+    parse_bucket_objects_report,
     parse_copy_report_for_delete_details,
     parse_copy_report_for_db_update,
     parse_deletable_report,
@@ -29,6 +31,7 @@ from app.services.excel_service import (
     parse_matched_report,
 )
 from app.services.mysql_service import list_databases, update_migrated_urls
+from app.services.reconciliation_service import _split_object_reference
 from app.services.sse import sse_stream
 from app.services.storage_service import (
     _DELETE_STREAM_BATCH_SIZE,
@@ -40,6 +43,8 @@ from app.services.storage_service import (
     iterate_bucket_objects,
     list_buckets,
     list_objects_page,
+    restore_dest_bucket,
+    restore_from_archive,
     validate_public_destination_urls,
 )
 from app.types import BucketSummary, StorageObject, StorageSummary
@@ -297,6 +302,72 @@ async def parse_matched_report_route(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail=str(error)) from error
 
     return {"status": True, "data": {"rows": rows, "count": len(rows)}}
+
+
+class ParseArchiveRefsBody(BaseModel):
+    lines: list[str]
+
+
+@router.post("/parse-archive-refs")
+async def parse_archive_refs(body: ParseArchiveRefsBody):
+    """
+    Parses pasted archive locations (one per line — a full URL, e.g.
+    "https://sgp1.digitaloceanspaces.com/scola-school-archives/scola-rosetta/foo.mp3", or a bare
+    "<archive bucket>/<original bucket>/<original key>" path) into {bucket, key} pairs for
+    /restore-from-archive. A URL is resolved against every configured provider's endpoint the
+    same way a DB path is during reconciliation (_split_object_reference); a bare path just takes
+    its first "/"-separated segment as the bucket. Either way, `key` comes out as
+    "<original bucket>/<original key>" — restore-from-archive strips that leading segment to get
+    back to the original location. A line that doesn't resolve to a bucket, or has nothing left
+    after it, is reported back as an error instead of silently dropped.
+    """
+    rows = []
+    errors = []
+    for raw_line in body.lines:
+        line = raw_line.strip()
+        if not line:
+            continue
+        bucket, key, _provider_hint = _split_object_reference(line)
+        if not bucket and "/" in key:
+            # Not a URL through any configured provider — fall back to treating a bare path's
+            # first segment as the bucket (the same convention the app's own archive keys use).
+            bucket, _, key = key.partition("/")
+        if not bucket:
+            errors.append({"line": line, "reason": "Could not determine the archive bucket — paste a full URL or \"bucket/key\" path"})
+            continue
+        if "/" not in key:
+            errors.append({"line": line, "reason": f"No \"/\" left in \"{key}\" after the archive bucket — nothing to restore to"})
+            continue
+        rows.append({"bucket": bucket, "key": key, "path": line})
+
+    return {"status": True, "data": {"rows": rows, "errors": errors, "count": len(rows)}}
+
+
+@router.post("/parse-bucket-objects-report")
+async def parse_bucket_objects_report_route(file: UploadFile = File(...)):
+    """
+    Alternative to /parse-archive-refs for the same /restore-from-archive flow: instead of pasting
+    URLs by hand, list the archive bucket itself via "List bucket objects", download that report
+    (optionally trimmed down to just the rows wanted), and upload it here. Each Key in it is
+    already in the archive convention "<original bucket>/<original key>", so no URL parsing is
+    needed — just pair it with the bucket the report says it was listed against.
+    """
+    content = await file.read()
+    try:
+        bucket, report_rows = await asyncio.to_thread(parse_bucket_objects_report, io.BytesIO(content))
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
+    rows = []
+    errors = []
+    for report_row in report_rows:
+        key = report_row["key"]
+        if "/" not in key:
+            errors.append({"line": key, "reason": f'No "/" in "{key}" — nothing to restore to'})
+            continue
+        rows.append({"bucket": bucket, "key": key, "path": report_row.get("url"), "sizeMb": report_row.get("sizeMb")})
+
+    return {"status": True, "data": {"rows": rows, "errors": errors, "count": len(rows)}}
 
 
 @router.post("/parse-copy-report")
@@ -715,6 +786,17 @@ class CopyBody(BaseModel):
     makePublic: bool = True
 
 
+class RestoreFromArchiveBody(BaseModel):
+    # Each item's bucket/key is the *archived* location (e.g. bucket="scola-school-archives",
+    # key="scola-rosetta/s3_ckf_files/files/foo.mp3" — see restore_dest_bucket/restore_dest_key),
+    # normally produced by POST /storage/parse-archive-refs from a pasted archive URL.
+    items: list[CopyItem]
+    sourceProvider: str
+    destProvider: str
+    overwrite: bool = False
+    makePublic: bool = True
+
+
 class DatabaseUrlUpdateItem(BaseModel):
     sourcePath: str
     destinationUrl: str
@@ -733,7 +815,19 @@ def _validate_copy_body(body: CopyBody) -> None:
     if len(body.items) == 0:
         raise HTTPException(status_code=400, detail="No items to copy")
     if body.sourceProvider == body.destProvider:
-        raise HTTPException(status_code=400, detail="Source and destination provider must be different")
+        # Same provider is fine (e.g. migrating between two buckets on the same DO/Wasabi
+        # account) as long as it actually lands somewhere else — otherwise every item would
+        # target its own source bucket/key and "copy" would silently no-op onto itself.
+        if not body.destBucket:
+            raise HTTPException(
+                status_code=400,
+                detail="Source and destination provider are the same — set a destination bucket to copy into",
+            )
+        if any(item.bucket == body.destBucket for item in body.items):
+            raise HTTPException(
+                status_code=400,
+                detail="Destination bucket must be different from the source bucket when copying within the same provider",
+            )
 
 
 def _write_copy_audit_log(
@@ -890,6 +984,197 @@ async def copy_stream(body: CopyBody):
         report_file = _build_copy_report(body, results, on_report_progress)
         audit_file = _write_copy_audit_log(
             body.sourceProvider, body.destProvider, body.destBucket, [i.model_dump() for i in body.items], results, report_file
+        )
+
+        succeeded = sum(1 for r in results if r["success"])
+        skipped_count = sum(1 for r in results if r.get("skipped"))
+        emit(
+            "done",
+            {
+                "results": results,
+                "succeededCount": succeeded,
+                "skippedCount": skipped_count,
+                "failedCount": len(results) - succeeded,
+                "auditFile": audit_file,
+                "reportFile": report_file,
+            },
+        )
+
+    return StreamingResponse(
+        sse_stream(work),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+    )
+
+
+def _validate_restore_body(body: RestoreFromArchiveBody) -> None:
+    if len(body.items) == 0:
+        raise HTTPException(status_code=400, detail="No items to restore")
+    malformed = [item.key for item in body.items if "/" not in item.key]
+    if malformed:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f'{len(malformed)} item(s) have no "/" in their archive key — expected '
+                f'"<original bucket>/<original key>" (e.g. from /parse-archive-refs), got "{malformed[0]}"'
+            ),
+        )
+    self_targeting = [item for item in body.items if restore_dest_bucket(item.bucket, item.key) == item.bucket]
+    if self_targeting:
+        item = self_targeting[0]
+        raise HTTPException(
+            status_code=400,
+            detail=f'Restoring "{item.key}" would target its own source bucket "{item.bucket}" — check the archive key',
+        )
+
+
+def _write_restore_audit_log(
+    source_provider: str,
+    dest_provider: str,
+    requested: list[dict],
+    results: list[dict],
+    report_file: str | None,
+) -> str:
+    audit_dir = os.path.join(env.reports_dir, ".restores")
+    os.makedirs(audit_dir, exist_ok=True)
+    audit_path = os.path.join(audit_dir, f"{datetime.now(timezone.utc):%Y%m%dT%H%M%S}-{uuid.uuid4().hex[:8]}.json")
+    with open(audit_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "sourceProvider": source_provider,
+                "destProvider": dest_provider,
+                "reportFile": report_file,
+                "requested": requested,
+                "results": results,
+            },
+            f,
+            indent=2,
+        )
+    return os.path.basename(audit_path)
+
+
+def _build_restore_report(
+    body: RestoreFromArchiveBody, results: list[dict], on_progress: ReportProgressCallback | None = None
+) -> str:
+    entries = []
+    for item, result in zip(body.items, results):
+        status = "Failed" if not result["success"] else ("Skipped" if result.get("skipped") else "Restored")
+        entries.append(
+            {
+                "archiveBucket": result["bucket"],
+                "archiveKey": result["key"],
+                "destBucket": result.get("destBucket"),
+                "destKey": result.get("destKey"),
+                "sizeMb": item.sizeMb,
+                "table": item.table,
+                "column": item.column,
+                "rowId": item.rowId,
+                "status": status,
+                "error": result.get("error"),
+            }
+        )
+    return generate_restore_report(
+        entries, body.destProvider, build_report_file_name(["restore", body.sourceProvider, body.destProvider]),
+        on_progress=on_progress,
+    )
+
+
+@router.post("/restore-from-archive")
+async def restore_from_archive_route(body: RestoreFromArchiveBody):
+    """
+    Copies archived objects back to their original bucket/key on destProvider — the reverse of
+    the "<original bucket>/<original key>" archive convention (see restore_dest_bucket /
+    restore_dest_key), e.g. "https://sgp1.digitaloceanspaces.com/scola-school-archives/scola-rosetta/foo.mp3"
+    restores to "https://sgp1.digitaloceanspaces.com/scola-rosetta/foo.mp3". Never touches the
+    archive copy itself — same non-destructive stance as /copy. Every request is written to
+    reports/.restores/ as an audit trail, and an .xlsx report is generated the same way every
+    other report in this app is.
+    """
+    _validate_restore_body(body)
+
+    items = [(i.bucket, i.key) for i in body.items]
+    results = await asyncio.to_thread(
+        restore_from_archive,
+        items, body.sourceProvider, body.destProvider, body.overwrite, body.makePublic,
+    )
+    report_file = await asyncio.to_thread(_build_restore_report, body, results)
+    audit_file = _write_restore_audit_log(
+        body.sourceProvider, body.destProvider, [i.model_dump() for i in body.items], results, report_file
+    )
+
+    succeeded = sum(1 for r in results if r["success"])
+    skipped = sum(1 for r in results if r.get("skipped"))
+    return {
+        "status": True,
+        "data": {
+            "results": results,
+            "succeededCount": succeeded,
+            "skippedCount": skipped,
+            "failedCount": len(results) - succeeded,
+            "auditFile": audit_file,
+            "reportFile": report_file,
+        },
+    }
+
+
+@router.post("/restore-from-archive/stream")
+async def restore_from_archive_stream(body: RestoreFromArchiveBody):
+    """
+    Same archive restore as POST /restore-from-archive, but reports progress as each object
+    finishes instead of one blocking call for the whole batch, plus `item_progress` events
+    mid-transfer — same reasoning as /copy/stream. Same audit trail and .xlsx report as the
+    non-streaming endpoint.
+    """
+    _validate_restore_body(body)
+
+    def work(emit):
+        items = [(i.bucket, i.key) for i in body.items]
+
+        def on_progress(completed: int, total: int, key: str, success: bool, skipped: bool) -> None:
+            emit(
+                "progress",
+                {
+                    "completed": completed,
+                    "total": total,
+                    "percent": round((completed / total) * 100) if total else 100,
+                    "key": key,
+                    "success": success,
+                    "skipped": skipped,
+                },
+            )
+
+        def on_item_progress(key: str, bytes_transferred: int, total_bytes: int) -> None:
+            emit(
+                "item_progress",
+                {
+                    "key": key,
+                    "bytesTransferred": bytes_transferred,
+                    "totalBytes": total_bytes,
+                    "percent": round((bytes_transferred / total_bytes) * 100) if total_bytes else 100,
+                },
+            )
+
+        results = restore_from_archive(
+            items, body.sourceProvider, body.destProvider, body.overwrite, body.makePublic,
+            on_progress=on_progress, on_item_progress=on_item_progress,
+        )
+
+        def on_report_progress(_phase: str, written: int, total: int, message: str, _extra: str | None) -> None:
+            emit(
+                "report_progress",
+                {
+                    "completed": written,
+                    "total": total,
+                    "percent": round((written / total) * 100) if total else 100,
+                    "message": message,
+                },
+            )
+
+        on_report_progress("report", 0, len(results), "Generating Excel report…", None)
+        report_file = _build_restore_report(body, results, on_report_progress)
+        audit_file = _write_restore_audit_log(
+            body.sourceProvider, body.destProvider, [i.model_dump() for i in body.items], results, report_file
         )
 
         succeeded = sum(1 for r in results if r["success"])

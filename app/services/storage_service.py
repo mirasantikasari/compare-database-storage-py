@@ -423,6 +423,7 @@ def copy_objects(
     on_progress: Callable[[int, int, str, bool, bool], None] | None = None,
     on_item_progress: Callable[[str, int, int], None] | None = None,
     dest_key_fn: Callable[[str, str], str] | None = None,
+    dest_bucket_fn: Callable[[str, str], str] | None = None,
 ) -> list[dict]:
     """
     Copies objects from one S3-compatible provider to another (e.g. DigitalOcean Spaces ->
@@ -480,11 +481,20 @@ def copy_objects(
     "<source bucket>/<source key>" path, so objects from different source buckets never collide
     once dest_bucket points them all at one shared bucket. Every result still reports the
     (unchanged) source key under "key" plus the resolved destination key under "destKey".
+
+    dest_bucket_fn(bucket, key), when given, computes the destination bucket per item instead of
+    the single dest_bucket/source-bucket rule above — e.g. restoring from the archive convention
+    "<original bucket>/<original key>" back out needs a different target bucket per item, read
+    off each item's own (archive) key, which a single dest_bucket value can't express. Takes
+    priority over dest_bucket when both are given.
     """
     src_client = get_s3_client(source_provider)
     dst_client = get_s3_client(dest_provider)
 
-    target_buckets = {dest_bucket or bucket for bucket, _key in items}
+    def resolve_dest_bucket(bucket: str, key: str) -> str:
+        return dest_bucket_fn(bucket, key) if dest_bucket_fn else (dest_bucket or bucket)
+
+    target_buckets = {resolve_dest_bucket(bucket, key) for bucket, key in items}
     bucket_errors = _ensure_dest_buckets(dst_client, dest_provider, target_buckets) if target_buckets else {}
 
     total = len(items)
@@ -500,7 +510,7 @@ def copy_objects(
     def copy_one(index: int) -> None:
         nonlocal completed
         bucket, key = items[index]
-        target_bucket = dest_bucket or bucket
+        target_bucket = resolve_dest_bucket(bucket, key)
         target_key = dest_key_fn(bucket, key) if dest_key_fn else key
         skipped = False
 
@@ -609,6 +619,52 @@ def copy_objects(
 
 def _archive_dest_key(bucket: str, key: str) -> str:
     return f"{bucket}/{key}"
+
+
+def restore_dest_bucket(bucket: str, key: str) -> str:
+    """The inverse of _archive_dest_key: recovers the original bucket from an archive key of the
+    form '<original bucket>/<original key>'. Exported (not underscore-prefixed) so callers can
+    apply the same rule up front to validate/preview a restore before running it."""
+    restored_bucket, _, _ = key.partition("/")
+    return restored_bucket
+
+
+def restore_dest_key(bucket: str, key: str) -> str:
+    """The inverse of _archive_dest_key: recovers the original key from an archive key of the
+    form '<original bucket>/<original key>'."""
+    _, _, restored_key = key.partition("/")
+    return restored_key
+
+
+def restore_from_archive(
+    items: list[tuple[str, str]],
+    archive_provider: str,
+    dest_provider: str,
+    overwrite: bool = False,
+    make_public: bool = True,
+    concurrency: int | None = None,
+    on_progress: Callable[[int, int, str, bool, bool], None] | None = None,
+    on_item_progress: Callable[[str, int, int], None] | None = None,
+) -> list[dict]:
+    """
+    Copies objects back out of the archive convention "<original bucket>/<original key>" (see
+    _archive_dest_key) to their original bucket/key on dest_provider — the reverse of
+    archive_and_delete_objects' copy-to-archive step. Never touches the archive copy itself, the
+    same way copy_objects never touches its source: this only lands a live copy back at the
+    original location, so a caller can confirm it before doing anything else with the archived
+    copy (repointing DB references, deleting the archive copy, etc. — all out of scope here).
+
+    Every item's key (the second element of each tuple) must already be in that "<bucket>/<key>"
+    archive form — the caller is expected to validate this against the same convention
+    restore_dest_bucket/restore_dest_key use, since a malformed key would otherwise resolve to a
+    nonsense destination bucket/key.
+    """
+    return copy_objects(
+        items, archive_provider, dest_provider,
+        overwrite=overwrite, make_public=make_public, concurrency=concurrency,
+        on_progress=on_progress, on_item_progress=on_item_progress,
+        dest_key_fn=restore_dest_key, dest_bucket_fn=restore_dest_bucket,
+    )
 
 
 def ensure_public_read_bucket_policy(provider: str, bucket: str) -> str | None:
