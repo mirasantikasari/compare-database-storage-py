@@ -3,7 +3,14 @@ __pycache__/
 *.pyc
 .env
 *.log
+.pytest_cache/
+
 reports/*.xlsx
 reports/.checkpoints/
 reports/.deletions/
-reports*fixed_sql/ 
+reports/.copies/
+reports/.restores/
+
+# scratch/debug scripts — never commit hardcoded credentials
+check.py
+sql_tables.txt
