@@ -6,4 +6,4 @@ __pycache__/
 reports/*.xlsx
 reports/.checkpoints/
 reports/.deletions/
-reports*
+reports*fixed_sql/ 

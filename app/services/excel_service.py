@@ -536,6 +536,64 @@ def parse_copy_report_for_delete_details(file_obj) -> tuple[list[dict], dict[str
     return results, stats, excluded
 
 
+def generate_deletion_report(
+    requested: list[dict],
+    results: list[dict],
+    excluded: list[dict] | None = None,
+    file_name: str | None = None,
+) -> str:
+    """Writes final deletion outcomes and pre-delete exclusions to one workbook."""
+    file_name = file_name or f"deletion-{datetime.now():%Y%m%dT%H%M%S}-{uuid.uuid4().hex[:8]}.xlsx"
+    workbook = Workbook(write_only=True)
+
+    headers = ["Bucket", "Key", "Path", "Size (MB)", "Error"]
+    deleted_sheet = workbook.create_sheet("Deleted")
+    failed_sheet = workbook.create_sheet("Failed")
+    deleted_sheet.append(_header_row(deleted_sheet, headers))
+    failed_sheet.append(_header_row(failed_sheet, headers))
+
+    deleted_count = 0
+    failed_count = 0
+    for index, result in enumerate(results):
+        request = requested[index] if index < len(requested) else {}
+        row = [
+            result.get("bucket") or request.get("bucket") or "",
+            result.get("key") or request.get("key") or "",
+            request.get("path") or "",
+            request.get("sizeMb"),
+            result.get("error") or "",
+        ]
+        if result.get("success"):
+            deleted_sheet.append(row)
+            deleted_count += 1
+        else:
+            failed_sheet.append(row)
+            failed_count += 1
+
+    excluded_rows = excluded or []
+    excluded_sheet = workbook.create_sheet("Excluded")
+    excluded_sheet.append(
+        _header_row(excluded_sheet, ["Bucket", "Key", "Destination URL", "Status", "Reason"])
+    )
+    for item in excluded_rows:
+        excluded_sheet.append(
+            [
+                item.get("bucket") or "",
+                item.get("key") or "",
+                item.get("destinationUrl") or "",
+                item.get("status") or "",
+                item.get("reason") or item.get("error") or "",
+            ]
+        )
+
+    summary = workbook.create_sheet("Summary", 0)
+    summary.append(_header_row(summary, ["Status", "Count"]))
+    summary.append(["Deleted", deleted_count])
+    summary.append(["Failed", failed_count])
+    summary.append(["Excluded", len(excluded_rows)])
+    return _save_workbook(workbook, file_name)
+
+
 def generate_archive_deletion_report(
     requested: list[dict],
     results: list[dict],

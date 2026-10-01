@@ -18,6 +18,7 @@ from app.services.excel_service import (
     build_report_file_name,
     buckets_label,
     generate_archive_deletion_report,
+    generate_deletion_report,
     generate_bucket_links_report,
     generate_bucket_objects_report,
     generate_copy_report,
@@ -36,6 +37,7 @@ from app.services.sse import sse_stream
 from app.services.storage_service import (
     _DELETE_STREAM_BATCH_SIZE,
     archive_and_delete_objects,
+    delete_objects,
     copy_objects,
     ensure_public_read_bucket_policy,
     get_storage_summary,
@@ -748,6 +750,59 @@ async def delete_stream(body: DeleteBody):
         raise HTTPException(status_code=409, detail=str(error)) from error
     return StreamingResponse(
         archive_jobs.stream(job),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+    )
+
+
+@router.post("/delete-migrated/stream")
+async def delete_migrated_stream(body: DeleteBody):
+    """
+    Permanent delete (no archive copy) for "Delete files already migrated": those objects already
+    live on the destination provider, so the destination is the backup. Same confirmation phrase
+    and audit trail as /delete/stream, which is the archive-first flow for "Delete files from report".
+    """
+    _validate_delete_body(body)
+
+    def work(emit):
+        items = [(i.bucket, i.key) for i in body.items]
+
+        def on_progress(completed: int, total: int, bucket: str, batch_results: list[dict]) -> None:
+            emit(
+                "progress",
+                {
+                    "completed": completed,
+                    "total": total,
+                    "percent": round((completed / total) * 100) if total else 100,
+                    "bucket": bucket,
+                    "results": batch_results,
+                },
+            )
+
+        results = delete_objects(
+            items, body.provider, batch_size=_DELETE_STREAM_BATCH_SIZE, on_progress=on_progress
+        )
+        audit_file = _write_deletion_audit_log(
+            body.provider, [i.model_dump() for i in body.items], results, body.excluded
+        )
+        report_file = generate_deletion_report(
+            [i.model_dump() for i in body.items], results, body.excluded
+        )
+
+        succeeded = sum(1 for r in results if r["success"])
+        emit(
+            "done",
+            {
+                "results": results,
+                "succeededCount": succeeded,
+                "failedCount": len(results) - succeeded,
+                "auditFile": audit_file,
+                "reportFile": report_file,
+            },
+        )
+
+    return StreamingResponse(
+        sse_stream(work),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
     )
