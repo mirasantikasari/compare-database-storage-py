@@ -166,7 +166,7 @@ def _load_env() -> Env:
         # (under a "<original bucket>/<original key>" path, so objects from different buckets never
         # collide once they share this one archive bucket). Original files are deleted only after signed-download verification. Defaults match the account this was set up for.
         archive_bucket=os.environ.get("ARCHIVE_S3_BUCKET", "scola-school-archives"),
-        archive_provider=os.environ.get("ARCHIVE_S3_PROVIDER", "do-sgp1"),
+        archive_provider=os.environ.get("ARCHIVE_S3_PROVIDER", "aws"),
     )
 
 
